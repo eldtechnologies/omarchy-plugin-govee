@@ -1,0 +1,214 @@
+"""Run the real CLI against a fake Govee cloud and a fake LAN light."""
+
+import json
+import os
+import shutil
+import stat
+import tempfile
+import unittest
+
+from helpers import API_KEY, CLOUD_ID, KEYRING_FILE, LAN_ID, PLUG_ID, FakeCloud, FakeLanLight, run_cli
+
+
+class Sandbox(unittest.TestCase):
+    """A fresh config and state directory per test."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="eld-govee-e2e-")
+        self.cloud = FakeCloud()
+        self.light = FakeLanLight()
+        self.env = {
+            "XDG_CONFIG_HOME": os.path.join(self.home, "config"),
+            "XDG_STATE_HOME": os.path.join(self.home, "state"),
+            "ELD_GOVEE_TEST_API_BASE": self.cloud.url,
+            "ELD_GOVEE_TEST_LAN": self.light.env,
+        }
+        if os.path.exists(KEYRING_FILE):
+            os.remove(KEYRING_FILE)
+
+    def tearDown(self):
+        self.cloud.close()
+        self.light.close()
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def cli(self, *args, stdin=None, ok=True):
+        result = run_cli(*args, env=self.env, stdin=stdin)
+        if ok:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def state(self):
+        with open(os.path.join(self.home, "state", "eld-govee", "state.json")) as handle:
+            return json.load(handle)
+
+    def device(self, device_id):
+        return next(d for d in self.state()["devices"] if d["id"] == device_id)
+
+    def setup_key(self):
+        return json.loads(self.cli("setup-save", stdin=API_KEY + "\n").stdout)
+
+
+class Setup(Sandbox):
+    def test_key_goes_to_the_keyring_not_the_config(self):
+        result = self.setup_key()
+        self.assertEqual(result["keyStore"], "keyring")
+        self.assertEqual(result["devices"], 3)
+        with open(KEYRING_FILE) as handle:
+            self.assertEqual(handle.read().strip(), API_KEY)
+        config_path = os.path.join(self.home, "config", "eld-govee", "config.json")
+        with open(config_path) as handle:
+            self.assertNotIn(API_KEY, handle.read())
+        self.assertEqual(stat.S_IMODE(os.stat(config_path).st_mode), 0o600)
+
+    def test_rejected_key_is_not_stored(self):
+        result = self.cli("setup-save", stdin="wrong-key-0000\n", ok=False)
+        self.assertIn("rejected", result.stderr)
+        self.assertFalse(os.path.exists(KEYRING_FILE))
+
+    def test_lan_only(self):
+        result = json.loads(self.cli("setup-save", "--lan-only").stdout)
+        self.assertEqual(result["keyStore"], "none")
+        devices = self.state()["devices"]
+        self.assertEqual([d["id"] for d in devices], [LAN_ID])
+        self.assertEqual(self.cloud.requests, [])
+
+    def test_lan_only_lights_can_be_renamed_and_reset(self):
+        self.cli("setup-save", "--lan-only")
+        self.assertEqual(self.device(LAN_ID)["name"], "H6008 0011")
+        self.cli("rename", LAN_ID, "Floor Lamp")
+        self.assertEqual(self.device(LAN_ID)["name"], "Floor Lamp")
+        self.cli("on", "floor lamp")  # the new name works as a target
+        self.assertIn(("turn", {"value": 1}), self.light.commands)
+        self.cli("rename", LAN_ID, "")
+        self.assertEqual(self.device(LAN_ID)["name"], "H6008 0011")
+
+    def test_unconfigured_commands_say_so(self):
+        self.assertIn("not set up", self.cli("on", ok=False).stderr)
+
+
+class Discovery(Sandbox):
+    def test_lan_and_cloud_devices_merge(self):
+        self.setup_key()
+        lamp = self.device(LAN_ID)
+        self.assertTrue(lamp["lan"])
+        self.assertEqual(lamp["name"], "Desk Lamp")
+        self.assertEqual(lamp["via"], "lan")
+        self.assertEqual(lamp["colorTemp"], 3000)
+        strip = self.device(CLOUD_ID)
+        self.assertFalse(strip["lan"])
+        self.assertEqual((strip["power"], strip["brightness"], strip["color"]), (False, 40, "#ff0000"))
+
+    def test_lan_device_state_never_costs_a_cloud_request(self):
+        self.setup_key()
+        self.assertNotIn(LAN_ID, json.dumps([r for r in self.cloud.requests if "state" in r]))
+
+    def test_address_comes_from_the_packet_not_the_payload(self):
+        self.setup_key()
+        cache = os.path.join(self.home, "state", "eld-govee", "cache.json")
+        with open(cache) as handle:
+            self.assertEqual(json.load(handle)["lan"][LAN_ID]["ip"], "127.0.0.1")
+
+    def test_lan_only_light_shows_offline_when_it_stops_answering(self):
+        self.cli("setup-save", "--lan-only")
+        self.light.close()
+        self.light = FakeLanLight(device_id="AB:AB:AB:AB:AB:AB:AB:AB")
+        self.env["ELD_GOVEE_TEST_LAN"] = self.light.env
+        self.cli("poll", "--max-age", "0")
+        self.assertIs(self.device(LAN_ID)["online"], False)
+
+
+class Control(Sandbox):
+    def setUp(self):
+        super().setUp()
+        self.setup_key()
+
+    def test_lan_light_is_driven_locally(self):
+        self.cli("brightness", "Desk Lamp", "60")
+        # Off before: woken first, then dimmed.
+        self.assertEqual(self.light.commands, [("turn", {"value": 1}), ("brightness", {"value": 60})])
+        self.assertEqual(self.cloud.controls, [])
+        lamp = self.device(LAN_ID)
+        self.assertEqual((lamp["power"], lamp["brightness"]), (True, 60))
+
+    def test_lan_falls_back_to_cloud_when_the_light_is_silent(self):
+        self.light.answer_status = False
+        self.cli("on", "Desk Lamp")
+        self.assertIn((LAN_ID, "powerSwitch", 1), self.cloud.controls)
+
+    def test_cloud_light(self):
+        self.cli("color", "Shelf Strip", "#00ff80")
+        self.assertEqual(self.cloud.controls, [(CLOUD_ID, "powerSwitch", 1),
+                                               (CLOUD_ID, "colorRgb", 0x00FF80)])
+        self.assertEqual(self.device(CLOUD_ID)["color"], "#00ff80")
+
+    def test_temperature_is_clamped_to_the_device_range(self):
+        self.cli("temp", "Shelf Strip", "10000")
+        self.assertIn((CLOUD_ID, "colorTemperatureK", 9000), self.cloud.controls)
+
+    def test_toggle_all_turns_everything_off_when_anything_is_on(self):
+        self.cli("toggle")  # the plug is on
+        self.assertIn((PLUG_ID, "powerSwitch", 0), self.cloud.controls)
+        self.assertFalse(any(d["power"] for d in self.state()["devices"]))
+
+    def test_relative_brightness(self):
+        self.cli("brightness", "Shelf Strip", "+15")
+        self.assertIn((CLOUD_ID, "brightness", 55), self.cloud.controls)
+
+    def test_scene_by_name(self):
+        self.cli("scene", "Shelf Strip", "aurora")
+        self.assertIn((CLOUD_ID, "lightScene", {"paramId": 2, "id": 22}), self.cloud.controls)
+        scenes = json.loads(self.cli("scenes", "Shelf Strip", "--json").stdout)
+        self.assertEqual([s["name"] for s in scenes], ["Sunrise", "Aurora"])
+
+    def test_unsupported_action_is_refused(self):
+        result = self.cli("brightness", "Fan Plug", "50", ok=False)
+        self.assertIn("support", result.stderr)
+
+    def test_failure_rolls_back_and_records_the_error(self):
+        self.cloud.state[CLOUD_ID]["powerSwitch"] = 0
+        self.cloud.close()  # cloud gone
+        result = self.cli("on", "Shelf Strip", ok=False)
+        self.assertIn("cannot reach", result.stderr)
+        self.assertIs(self.device(CLOUD_ID)["power"], False)
+        self.assertIn("cannot reach", self.state()["error"]["message"])
+        self.cli("dismiss")
+        self.assertIsNone(self.state()["error"])
+        self.cloud = FakeCloud()  # for tearDown
+
+    def test_groups(self):
+        self.cli("group", "set", "Office", "Desk Lamp", "Shelf Strip")
+        self.cli("off", "office")
+        group = self.state()["groups"][0]
+        self.assertEqual((group["name"], group["members"], group["power"]),
+                         ("Office", [LAN_ID, CLOUD_ID], False))
+        self.cli("on", "Office")
+        self.assertEqual(self.state()["groups"][0]["onCount"], 2)
+        self.cli("group", "remove", "office")
+        self.assertEqual(self.state()["groups"], [])
+
+    def test_editing_groups_keeps_lan_lights_on_the_lan(self):
+        self.cli("group", "set", "Office", "Desk Lamp")
+        self.assertTrue(self.device(LAN_ID)["lan"])
+        self.cli("on", "Office")
+        self.assertEqual(self.cloud.controls, [])
+        self.assertIn(("turn", {"value": 1}), self.light.commands)
+
+    def test_rename_and_hide(self):
+        self.cli("rename", "Shelf Strip", "Bookcase")
+        self.assertEqual(self.device(CLOUD_ID)["name"], "Bookcase")
+        self.cli("hide", "Fan Plug")
+        self.cli("off")
+        self.assertNotIn((PLUG_ID, "powerSwitch", 0), self.cloud.controls)
+
+    def test_usage_is_counted(self):
+        self.cli("on", "Shelf Strip")
+        self.assertGreater(self.state()["usage"]["today"], 0)
+
+    def test_forget_key(self):
+        self.cli("forget-key")
+        self.assertFalse(os.path.exists(KEYRING_FILE))
+        self.assertFalse(self.state()["configured"])
+
+
+if __name__ == "__main__":
+    unittest.main()

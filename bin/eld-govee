@@ -1,0 +1,1407 @@
+#!/usr/bin/env python3
+"""Govee lights helper for the Omarchy shell.
+
+The shell never touches the network or holds the API key. This CLI does both:
+it finds lights on the local network with Govee's LAN API, falls back to the
+Govee cloud API (openapi.api.govee.com) for lights without it, and for names
+and scenes, and writes their state to a file the panel watches.
+"""
+
+import argparse
+import contextlib
+import fcntl
+import getpass
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "eld-govee")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "eld-govee")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+CACHE_PATH = os.path.join(STATE_DIR, "cache.json")
+STATE_LOCK = os.path.join(STATE_DIR, "state.lock")
+LAN_LOCK = os.path.join(STATE_DIR, "lan.lock")
+
+
+def _loopback_only(value):
+    """Test hooks may only point at this machine, so a stray environment
+    variable can never send the API key or commands somewhere else."""
+    host = urllib.parse.urlsplit(value if "//" in value else "//" + value).hostname or ""
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+API_BASE = "https://openapi.api.govee.com/router/api/v1"
+_test_api = os.environ.get("ELD_GOVEE_TEST_API_BASE", "")
+if _test_api and _loopback_only(_test_api):
+    API_BASE = _test_api.rstrip("/")
+
+# Govee LAN API: discovery goes to a multicast group on 4001, devices answer
+# on 4002, and take commands on 4003.
+LAN_SCAN_ADDR, LAN_SCAN_PORT, LAN_LISTEN_PORT, LAN_CONTROL_PORT = "239.255.255.250", 4001, 4002, 4003
+_test_lan = os.environ.get("ELD_GOVEE_TEST_LAN", "")  # "127.0.0.1:scan:listen:control"
+if _test_lan and _loopback_only(_test_lan.split(":")[0]):
+    _parts = _test_lan.split(":")
+    LAN_SCAN_ADDR = _parts[0]
+    LAN_SCAN_PORT, LAN_LISTEN_PORT, LAN_CONTROL_PORT = (int(p) for p in _parts[1:4])
+
+DAILY_LIMIT = 10000  # Govee's documented per-account cloud quota
+DEVICE_LIST_TTL = 12 * 3600
+SCENE_TTL = 7 * 86400
+LAN_IP_TTL = 15 * 60
+MAX_RESPONSE = 4 * 1024 * 1024
+
+DEVICE_ID = re.compile(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5,7}")
+SKU = re.compile(r"[A-Za-z0-9_-]{1,24}")
+
+COLOR_NAMES = {
+    "red": "ff0000", "orange": "ff7a00", "yellow": "ffd000", "green": "00ff40",
+    "cyan": "00e5ff", "blue": "0040ff", "purple": "8a2be2", "pink": "ff2d95",
+    "white": "ffffff", "warm": "ffb46b",
+}
+
+
+def plugin_version():
+    """The version lives in manifest.json alone, so the two never drift."""
+    manifest = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "manifest.json")
+    try:
+        with open(manifest) as handle:
+            return json.load(handle).get("version", "unknown")
+    except (OSError, ValueError):
+        return "unknown"
+
+
+class GoveeError(Exception):
+    pass
+
+
+# ---- files ---------------------------------------------------------------
+
+
+def write_atomic(path, data, mode=0o600):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    with open(tmp, "wb") as handle:
+        handle.write(data if isinstance(data, bytes) else data.encode())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def write_json(path, value):
+    write_atomic(path, json.dumps(value, indent=2) + "\n")
+
+
+def read_json(path, default):
+    try:
+        with open(path) as handle:
+            value = json.load(handle)
+        return value if isinstance(value, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+@contextlib.contextmanager
+def locked(path):
+    """Serialize read-modify-write cycles between concurrent helper runs:
+    the panel fires a command per click, and they overlap."""
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def clean_text(value, fallback="", limit=60):
+    """Printable text only: names come from the Govee account and the network,
+    so drop control and format characters, collapse whitespace, cap length."""
+    text = "".join(ch if unicodedata.category(ch)[0] not in "CZ" else " "
+                   for ch in str(value or ""))
+    text = " ".join(text.split())[:limit]
+    return text or fallback
+
+
+def norm_id(value):
+    text = str(value or "").strip().upper()
+    return text if DEVICE_ID.fullmatch(text) else ""
+
+
+def norm_sku(value):
+    text = str(value or "").strip()
+    return text if SKU.fullmatch(text) else ""
+
+
+def parse_color(text):
+    value = str(text).strip().lower()
+    value = COLOR_NAMES.get(value, value).lstrip("#")
+    if not re.fullmatch(r"[0-9a-f]{6}", value):
+        raise GoveeError(f"not a colour: {text!r} (use #rrggbb or one of {', '.join(COLOR_NAMES)})")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def hex_color(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(c))) for c in rgb)
+
+
+# ---- API key storage -----------------------------------------------------
+#
+# The key goes to the desktop keyring (Secret Service, via secret-tool) when
+# one is available: encrypted at rest and locked with the session. Without a
+# keyring it stays in config.json, which only the user can read. It always
+# travels to and from secret-tool on stdin/stdout, never on a command line.
+
+KEYRING_SERVICE = "eld-govee"
+_key_cache = {}
+
+
+class KeyringUnavailable(Exception):
+    pass
+
+
+def _secret_tool(args, secret=None):
+    tool = shutil.which("secret-tool")
+    if not tool:
+        raise KeyringUnavailable("secret-tool is not installed (package libsecret)")
+    try:
+        result = subprocess.run([tool, *args], input=secret, capture_output=True,
+                                text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        raise KeyringUnavailable("the keyring did not answer; is it locked?")
+    if result.returncode != 0 and result.stderr.strip():
+        raise KeyringUnavailable(result.stderr.strip().splitlines()[-1])
+    return result
+
+
+def keyring_store(key):
+    result = _secret_tool(["store", "--label=Govee API key", "service", KEYRING_SERVICE,
+                           "account", "default"], secret=key)
+    if result.returncode != 0:
+        raise KeyringUnavailable("the keyring refused to store the key")
+    _key_cache["default"] = key
+
+
+def keyring_lookup():
+    if "default" not in _key_cache:
+        result = _secret_tool(["lookup", "service", KEYRING_SERVICE, "account", "default"])
+        _key_cache["default"] = result.stdout.strip() if result.returncode == 0 else ""
+    return _key_cache["default"]
+
+
+def keyring_clear():
+    _key_cache.pop("default", None)
+    _secret_tool(["clear", "service", KEYRING_SERVICE, "account", "default"])
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as handle:
+            config = json.load(handle)
+    except FileNotFoundError:
+        config = {}
+    except (OSError, ValueError) as error:
+        raise GoveeError(f"cannot read {CONFIG_PATH}: {error}")
+    if not isinstance(config, dict):
+        config = {}
+    for name, empty in (("groups", {}), ("aliases", {}), ("hidden", [])):
+        if not isinstance(config.get(name), type(empty)):
+            config[name] = empty
+    return config
+
+
+def save_config(config):
+    stored = dict(config)
+    if stored.get("keyStore") == "keyring":
+        stored.pop("apiKey", None)
+    write_json(CONFIG_PATH, stored)
+    os.chmod(CONFIG_DIR, 0o700)
+
+
+def api_key(config):
+    if config.get("keyStore") == "keyring":
+        try:
+            return keyring_lookup()
+        except KeyringUnavailable as error:
+            raise GoveeError(f"cannot read the API key from the keyring: {error}")
+    return str(config.get("apiKey") or "")
+
+
+def has_cloud(config):
+    return config.get("keyStore") == "keyring" or bool(config.get("apiKey"))
+
+
+def is_configured(config):
+    return has_cloud(config) or config.get("lanOnly") is True
+
+
+def store_key(config, key):
+    try:
+        keyring_store(key)
+        config["keyStore"] = "keyring"
+        config.pop("apiKey", None)
+        return "keyring"
+    except KeyringUnavailable:
+        config.pop("keyStore", None)
+        config["apiKey"] = key
+        return "file"
+
+
+def valid_key(key):
+    return bool(re.fullmatch(r"[A-Za-z0-9-]{8,128}", key))
+
+
+# ---- cloud API -----------------------------------------------------------
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: it would carry the API key to another host."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+_usage_lock = threading.Lock()
+_usage = {"requests": 0}
+
+
+def count_request():
+    with _usage_lock:
+        _usage["requests"] += 1
+
+
+class Cloud:
+    def __init__(self, key, timeout=8):
+        self.key = key
+        self.timeout = timeout
+
+    def request(self, method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(API_BASE + path, data=data, method=method, headers={
+            "Govee-API-Key": self.key,
+            "Content-Type": "application/json",
+            "User-Agent": f"eld-govee/{plugin_version()}",
+        })
+        count_request()
+        try:
+            with _opener.open(request, timeout=self.timeout) as response:
+                raw = response.read(MAX_RESPONSE)
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                raise GoveeError("the Govee API key was rejected")
+            if error.code == 429:
+                raise GoveeError("Govee's request limit was reached; try again later")
+            detail = ""
+            try:
+                body = json.loads(error.read(65536))
+                detail = clean_text(body.get("msg") or body.get("message"), "", 120)
+            except (ValueError, AttributeError, OSError):
+                pass
+            raise GoveeError(f"Govee cloud error {error.code}" + (f": {detail}" if detail else ""))
+        except (urllib.error.URLError, OSError) as error:
+            reason = getattr(error, "reason", error)
+            raise GoveeError(f"cannot reach the Govee cloud: {reason}")
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            raise GoveeError("unexpected answer from the Govee cloud")
+        if not isinstance(payload, dict):
+            raise GoveeError("unexpected answer from the Govee cloud")
+        code = payload.get("code", 200)
+        if code != 200:
+            detail = clean_text(payload.get("msg") or payload.get("message"), "unknown error", 120)
+            if code in (401, 403):
+                raise GoveeError("the Govee API key was rejected")
+            raise GoveeError(f"Govee cloud: {detail}")
+        return payload
+
+    def devices(self):
+        data = self.request("GET", "/user/devices").get("data")
+        return data if isinstance(data, list) else []
+
+    def _device_payload(self, device):
+        return {"requestId": str(uuid.uuid4()),
+                "payload": {"sku": device["sku"], "device": device["id"]}}
+
+    def state(self, device):
+        payload = self.request("POST", "/device/state", self._device_payload(device)).get("payload") or {}
+        return payload.get("capabilities") or []
+
+    def control(self, device, cap_type, instance, value):
+        body = self._device_payload(device)
+        body["payload"]["capability"] = {"type": f"devices.capabilities.{cap_type}",
+                                         "instance": instance, "value": value}
+        self.request("POST", "/device/control", body)
+
+    def scenes(self, device):
+        options = []
+        for path, kind in (("/device/scenes", "scene"), ("/device/diy-scenes", "diy")):
+            try:
+                payload = self.request("POST", path, self._device_payload(device)).get("payload") or {}
+            except GoveeError:
+                if kind == "diy":
+                    continue  # plenty of devices have no DIY scenes
+                raise
+            for cap in payload.get("capabilities") or []:
+                for option in (cap.get("parameters") or {}).get("options") or []:
+                    name = clean_text(option.get("name"))
+                    if name and option.get("value") is not None:
+                        options.append({"name": name, "kind": kind, "instance": cap.get("instance"),
+                                        "value": option["value"]})
+        return options
+
+
+def cap_key(cap):
+    return str(cap.get("type", "")).rsplit(".", 1)[-1], str(cap.get("instance", ""))
+
+
+def cap_range(parameters, fallback):
+    span = (parameters or {}).get("range") or {}
+    try:
+        low, high = int(span.get("min", fallback[0])), int(span.get("max", fallback[1]))
+        return [low, high] if low < high else list(fallback)
+    except (TypeError, ValueError):
+        return list(fallback)
+
+
+def summarize_cloud(raw):
+    """One device from /user/devices, or None for anything we cannot switch."""
+    if not isinstance(raw, dict):
+        return None
+    device_id, sku = norm_id(raw.get("device")), norm_sku(raw.get("sku"))
+    if not device_id or not sku:
+        return None
+    caps = {cap_key(c): c.get("parameters") or {} for c in raw.get("capabilities") or []
+            if isinstance(c, dict)}
+    if ("on_off", "powerSwitch") not in caps:
+        return None
+    snapshots = []
+    for option in (caps.get(("dynamic_scene", "snapshot")) or {}).get("options") or []:
+        name = clean_text(option.get("name"))
+        if name and option.get("value") is not None:
+            snapshots.append({"name": name, "kind": "snapshot", "instance": "snapshot",
+                              "value": option["value"]})
+    return {
+        "id": device_id,
+        "sku": sku,
+        "cloudName": clean_text(raw.get("deviceName"), sku),
+        "cloud": True,
+        "kind": "plug" if "socket" in str(raw.get("type", "")) else "light",
+        "supports": {
+            "power": True,
+            "brightness": ("range", "brightness") in caps,
+            "color": ("color_setting", "colorRgb") in caps,
+            "temp": ("color_setting", "colorTemperatureK") in caps,
+            "scenes": ("dynamic_scene", "lightScene") in caps or ("dynamic_scene", "diyScene") in caps
+                      or bool(snapshots),
+        },
+        "brightnessRange": cap_range(caps.get(("range", "brightness")), (1, 100)),
+        "tempRange": cap_range(caps.get(("color_setting", "colorTemperatureK")), (2000, 9000)),
+        "snapshots": snapshots,
+    }
+
+
+def read_cloud_state(capabilities, device):
+    """Turn /device/state capabilities into our fields."""
+    values = {}
+    for cap in capabilities:
+        if isinstance(cap, dict):
+            values[cap_key(cap)] = (cap.get("state") or {}).get("value")
+    out = {}
+    online = values.get(("online", "online"))
+    if isinstance(online, bool):
+        out["online"] = online
+    power = values.get(("on_off", "powerSwitch"))
+    if isinstance(power, int):
+        out["power"] = power == 1
+    level = values.get(("range", "brightness"))
+    if isinstance(level, int):
+        out["brightness"] = to_percent(level, device.get("brightnessRange") or [1, 100])
+    temp = values.get(("color_setting", "colorTemperatureK"))
+    rgb = values.get(("color_setting", "colorRgb"))
+    if isinstance(temp, int) and temp > 0:
+        out["mode"], out["colorTemp"] = "temp", temp
+    elif isinstance(rgb, int) and rgb >= 0:
+        out["mode"], out["color"] = "color", hex_color(((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255))
+    return out
+
+
+def to_percent(level, span):
+    low, high = span
+    if (low, high) == (1, 100) or (low, high) == (0, 100):
+        return max(0, min(100, level))
+    return max(1, min(100, round((level - low) * 100 / (high - low))))
+
+
+def from_percent(percent, span):
+    low, high = span
+    if (low, high) == (1, 100) or (low, high) == (0, 100):
+        return max(1, min(100, percent))
+    return max(low, min(high, round(low + percent * (high - low) / 100)))
+
+
+# ---- LAN API -------------------------------------------------------------
+#
+# Every reply comes back to UDP 4002, so only one helper may listen at a time:
+# LAN work runs under LAN_LOCK, or concurrent runs would steal each other's
+# replies.
+
+
+class Lan:
+    def __init__(self):
+        self.sock = None
+
+    def __enter__(self):
+        self._lock = locked(LAN_LOCK)
+        self._lock.__enter__()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+            sock.bind(("", LAN_LISTEN_PORT))
+            self.sock = sock
+        except OSError as error:
+            self._lock.__exit__(None, None, None)
+            raise GoveeError(f"cannot listen on UDP {LAN_LISTEN_PORT}: {error.strerror or error}")
+        return self
+
+    def __exit__(self, *exc):
+        if self.sock:
+            self.sock.close()
+        self._lock.__exit__(*exc)
+
+    def _send(self, address, port, cmd, data):
+        message = json.dumps({"msg": {"cmd": cmd, "data": data}}).encode()
+        self.sock.sendto(message, (address, port))
+
+    def _receive(self, deadline):
+        """Yield (ip, cmd, data) until the deadline."""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self.sock.settimeout(remaining)
+            try:
+                raw, (ip, _port) = self.sock.recvfrom(4096)
+            except (socket.timeout, OSError):
+                return
+            try:
+                msg = json.loads(raw).get("msg") or {}
+                yield ip, str(msg.get("cmd", "")), msg.get("data") or {}
+            except (ValueError, AttributeError):
+                continue
+
+    def scan(self, timeout=1.6):
+        """{device_id: {"ip", "sku"}} for every device with LAN Control on."""
+        found = {}
+        for _ in range(2):  # UDP: ask twice in case the first is lost
+            self._send(LAN_SCAN_ADDR, LAN_SCAN_PORT, "scan", {"account_topic": "reserve"})
+        for ip, cmd, data in self._receive(time.monotonic() + timeout):
+            device_id, sku = norm_id(data.get("device")), norm_sku(data.get("sku"))
+            # The address we act on is the one the reply came from, never one
+            # named inside the payload.
+            if cmd == "scan" and device_id and sku:
+                found[device_id] = {"ip": ip, "sku": sku}
+        return found
+
+    def command(self, ip, cmd, data):
+        self._send(ip, LAN_CONTROL_PORT, cmd, data)
+
+    def status(self, ips, timeout=1.0):
+        """{ip: fields} for the devices that answered devStatus."""
+        wanted = set(ips)
+        for ip in wanted:
+            self._send(ip, LAN_CONTROL_PORT, "devStatus", {})
+        answers = {}
+        for ip, cmd, data in self._receive(time.monotonic() + timeout):
+            if cmd == "devStatus" and ip in wanted:
+                answers[ip] = read_lan_state(data)
+                if len(answers) == len(wanted):
+                    break
+        return answers
+
+
+def read_lan_state(data):
+    out = {"online": True}
+    if isinstance(data.get("onOff"), int):
+        out["power"] = data["onOff"] == 1
+    if isinstance(data.get("brightness"), int):
+        out["brightness"] = max(0, min(100, data["brightness"]))
+    temp, color = data.get("colorTemInKelvin"), data.get("color")
+    if isinstance(temp, int) and temp > 0:
+        out["mode"], out["colorTemp"] = "temp", temp
+    elif isinstance(color, dict):
+        try:
+            out["mode"], out["color"] = "color", hex_color((color["r"], color["g"], color["b"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return out
+
+
+def lan_message(action, value):
+    if action == "power":
+        return "turn", {"value": 1 if value else 0}
+    if action == "brightness":
+        return "brightness", {"value": max(1, min(100, value))}
+    if action == "color":
+        r, g, b = value
+        return "colorwc", {"color": {"r": r, "g": g, "b": b}, "colorTemInKelvin": 0}
+    if action == "temp":
+        return "colorwc", {"color": {"r": 0, "g": 0, "b": 0}, "colorTemInKelvin": value}
+    return None
+
+
+def local_subnet():
+    """The network behind the default route, for the firewall hint."""
+    try:
+        route = json.loads(subprocess.run(["ip", "-j", "-4", "route", "show", "default"],
+                                          capture_output=True, text=True, timeout=3).stdout or "[]")
+        dev = route[0]["dev"]
+        addrs = json.loads(subprocess.run(["ip", "-j", "-4", "addr", "show", "dev", dev],
+                                          capture_output=True, text=True, timeout=3).stdout or "[]")
+        info = addrs[0]["addr_info"][0]
+        return str(ipaddress.ip_interface(f"{info['local']}/{info['prefixlen']}").network)
+    except (OSError, ValueError, LookupError, subprocess.TimeoutExpired):
+        return ""
+
+
+def firewall_hint():
+    """ufw with a dropping input policy eats the devices' replies on 4002,
+    which makes LAN discovery look like no device supports it."""
+    try:
+        with open("/etc/ufw/ufw.conf") as handle:
+            if not re.search(r"^ENABLED=yes", handle.read(), re.M):
+                return ""
+        with open("/etc/default/ufw") as handle:
+            policy = re.search(r'^DEFAULT_INPUT_POLICY="?(\w+)', handle.read(), re.M)
+        if policy and policy.group(1).upper() == "ACCEPT":
+            return ""
+    except OSError:
+        return ""
+    for path in ("/etc/ufw/user.rules", "/etc/ufw/before.rules"):
+        try:
+            with open(path) as handle:
+                if re.search(rf"--dport {LAN_LISTEN_PORT}\b", handle.read()):
+                    return ""
+        except OSError:
+            pass
+    subnet = local_subnet() or "192.168.0.0/16"
+    return f"sudo ufw allow from {subnet} to any port {LAN_LISTEN_PORT} proto udp comment 'Govee LAN'"
+
+
+# ---- devices and state ---------------------------------------------------
+
+
+def lan_only_device(device_id, sku):
+    return {
+        "id": device_id, "sku": sku, "cloudName": f"{sku} {device_id[-5:].replace(':', '')}",
+        "cloud": False, "kind": "light",
+        "supports": {"power": True, "brightness": True, "color": True, "temp": True, "scenes": False},
+        "brightnessRange": [1, 100], "tempRange": [2000, 9000], "snapshots": [],
+    }
+
+
+def load_cache():
+    return read_json(CACHE_PATH, {})
+
+
+def update_file(path, change):
+    """Read, change and write one JSON file under the state lock."""
+    with locked(STATE_LOCK):
+        value = read_json(path, {})
+        change(value)
+        write_json(path, value)
+        return value
+
+
+def today():
+    return time.strftime("%Y-%m-%d")
+
+
+def flush_usage():
+    with _usage_lock:
+        count, _usage["requests"] = _usage["requests"], 0
+    if not count:
+        return
+
+    def change(cache):
+        usage = cache.get("usage") if isinstance(cache.get("usage"), dict) else {}
+        if usage.get("day") != today():
+            usage = {"day": today(), "count": 0}
+        usage["count"] = int(usage.get("count", 0)) + count
+        cache["usage"] = usage
+
+    cache = update_file(CACHE_PATH, change)
+    with locked(STATE_LOCK):
+        state = read_json(STATE_PATH, {})
+        if state.get("devices") is not None:
+            state["usage"] = {"today": usage_today(cache), "limit": DAILY_LIMIT}
+            write_json(STATE_PATH, state)
+
+
+def usage_today(cache):
+    usage = cache.get("usage") or {}
+    return int(usage.get("count", 0)) if usage.get("day") == today() else 0
+
+
+def build_registry(config, cache, lan_found):
+    """Every known device, keyed by id: the cloud list, plus LAN-only finds."""
+    registry = {}
+    for raw in (cache.get("devices") or {}).get("list") or []:
+        device = summarize_cloud(raw)
+        if device:
+            registry[device["id"]] = device
+    # LAN-only lights seen before stay listed, offline, instead of vanishing.
+    for device_id, sku in (cache.get("lanKnown") or {}).items():
+        if device_id not in registry and norm_id(device_id) and norm_sku(sku):
+            registry[device_id] = lan_only_device(device_id, sku)
+    for device_id, info in lan_found.items():
+        if device_id not in registry:
+            registry[device_id] = lan_only_device(device_id, info["sku"])
+        registry[device_id]["ip"] = info["ip"]
+    for device in registry.values():
+        alias = clean_text(config["aliases"].get(device["id"]))
+        device["name"] = alias or device["cloudName"]
+        device["hidden"] = device["id"] in config["hidden"]
+    return registry
+
+
+def lan_ips(cache, scanned):
+    """Fresh scan results, plus addresses seen recently: a busy device can
+    miss one scan without dropping off the LAN."""
+    now = time.time()
+    known = {k: v for k, v in (cache.get("lan") or {}).items()
+             if isinstance(v, dict) and now - v.get("seenAt", 0) < LAN_IP_TTL}
+    for device_id, info in scanned.items():
+        known[device_id] = dict(info, seenAt=now)
+    return known
+
+
+def group_view(config, devices):
+    by_id = {d["id"]: d for d in devices}
+    groups = []
+    for name, members in sorted(config["groups"].items(), key=lambda kv: kv[0].lower()):
+        present = [by_id[m] for m in members if m in by_id]
+        on = [d for d in present if d.get("power")]
+        levels = [d["brightness"] for d in on if isinstance(d.get("brightness"), int)]
+        groups.append({
+            "name": clean_text(name), "members": [d["id"] for d in present],
+            "power": bool(on), "onCount": len(on),
+            "brightness": round(sum(levels) / len(levels)) if levels else None,
+            "supports": {key: any(d["supports"].get(key) for d in present)
+                         for key in ("brightness", "color", "temp", "scenes")},
+        })
+    return groups
+
+
+FIELDS = ("online", "power", "brightness", "mode", "color", "colorTemp")
+
+
+def compose_state(config, registry, previous, fresh, cache, extra):
+    """The panel's view: registry entries with the newest known readings."""
+    prev = {d.get("id"): d for d in previous.get("devices") or [] if isinstance(d, dict)}
+    devices = []
+    for device in registry.values():
+        entry = dict(device)
+        entry.pop("cloudName", None)
+        old = prev.get(device["id"], {})
+        for field in FIELDS:
+            entry[field] = old.get(field)
+        entry["updatedAt"] = old.get("updatedAt", 0)
+        entry["via"] = old.get("via", "")
+        if device["id"] in fresh:
+            entry.update(fresh[device["id"]])
+            entry["updatedAt"] = time.time()
+        entry["lan"] = bool(device.get("ip"))
+        devices.append(entry)
+    devices.sort(key=lambda d: (d["hidden"], d["name"].lower()))
+    state = {
+        "updatedAt": time.time(),
+        "configured": is_configured(config),
+        "cloud": has_cloud(config),
+        "devices": devices,
+        "groups": group_view(config, devices),
+        "usage": {"today": usage_today(cache), "limit": DAILY_LIMIT},
+        "error": previous.get("error"),
+        "version": plugin_version(),
+    }
+    state.update(extra)
+    return state
+
+
+def poll(max_age=300, refresh_devices=False, scan=True):
+    """Refresh the device list (rarely), the LAN (always) and cloud state
+    for devices the LAN cannot answer for (only when older than max_age)."""
+    config = load_config()
+    cache = load_cache()
+    previous = read_json(STATE_PATH, {})
+    extra = {"cloudError": "", "lanError": "", "lanHint": ""}
+    if not is_configured(config):
+        state = compose_state(config, {}, {}, {}, cache, extra)
+        with locked(STATE_LOCK):
+            write_json(STATE_PATH, state)
+        return state
+
+    cloud = None
+    if has_cloud(config):
+        try:
+            cloud = Cloud(api_key(config))
+            listed = cache.get("devices") or {}
+            if refresh_devices or time.time() - listed.get("fetchedAt", 0) > DEVICE_LIST_TTL:
+                raw = cloud.devices()
+                update_file(CACHE_PATH, lambda c: c.update(devices={"fetchedAt": time.time(), "list": raw}))
+                cache["devices"] = {"fetchedAt": time.time(), "list": raw}
+        except GoveeError as error:
+            extra["cloudError"] = str(error)
+
+    reachable, lan_status = {}, {}
+    if scan:
+        try:
+            with Lan() as lan:
+                scanned = lan.scan()
+                ips = lan_ips(cache, scanned)
+                by_ip = {v["ip"]: k for k, v in ips.items()}
+                for ip, fields in lan.status(list(by_ip)).items():
+                    lan_status[by_ip[ip]] = dict(fields, via="lan")
+            reachable = {k: v for k, v in ips.items() if k in lan_status or k in scanned}
+
+            def remember(c):
+                c["lan"] = {k: dict(v, seenAt=time.time()) if k in lan_status else v for k, v in ips.items()}
+                known = c.get("lanKnown") if isinstance(c.get("lanKnown"), dict) else {}
+                known.update({k: v["sku"] for k, v in reachable.items()})
+                c["lanKnown"] = known
+
+            cache = update_file(CACHE_PATH, remember)
+        except GoveeError as error:
+            extra["lanError"] = str(error)
+        if not reachable:
+            extra["lanHint"] = firewall_hint()
+    else:
+        # No scan this time (a rename, a group edit): keep the addresses seen
+        # recently, or LAN lights would drop to the cloud until the next scan.
+        reachable = lan_ips(cache, {})
+
+    registry = build_registry(config, cache, reachable)
+    fresh = dict(lan_status)
+    if cloud and not extra["cloudError"]:
+        prev = {d.get("id"): d for d in previous.get("devices") or [] if isinstance(d, dict)}
+        due = [d for d in registry.values() if d["cloud"] and d["id"] not in fresh
+               and time.time() - prev.get(d["id"], {}).get("updatedAt", 0) >= max_age]
+
+        def fetch(device):
+            try:
+                return device["id"], dict(read_cloud_state(cloud.state(device), device), via="cloud"), None
+            except GoveeError as error:
+                return device["id"], None, str(error)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for device_id, fields, error in pool.map(fetch, due):
+                if fields is not None:
+                    fresh[device_id] = fields
+                elif error:
+                    extra["cloudError"] = error
+    if scan and not extra["lanError"]:
+        for device_id, device in registry.items():
+            if not device["cloud"] and device_id not in lan_status:
+                fresh[device_id] = {"online": False, "via": "lan"}
+
+    with locked(STATE_LOCK):
+        previous = read_json(STATE_PATH, {})
+        state = compose_state(config, registry, previous, fresh, load_cache(), extra)
+        write_json(STATE_PATH, state)
+    return state
+
+
+def current_state():
+    state = read_json(STATE_PATH, {})
+    return state if state.get("devices") is not None else poll()
+
+
+def resolve(state, config, target):
+    """A device id, a group name, a device name, or "all"."""
+    devices = state.get("devices") or []
+    wanted = str(target or "").strip()
+    if wanted.lower() == "all":
+        found = [d for d in devices if not d.get("hidden")]
+        if not found:
+            raise GoveeError("no lights found")
+        return found
+    by_id = {d["id"]: d for d in devices}
+    if norm_id(wanted) in by_id:
+        return [by_id[norm_id(wanted)]]
+    for name, members in config["groups"].items():
+        if name.lower() == wanted.lower():
+            found = [by_id[m] for m in members if m in by_id]
+            if not found:
+                raise GoveeError(f"group {name!r} has no devices that are online")
+            return found
+    matches = [d for d in devices if d["name"].lower() == wanted.lower()]
+    if not matches:
+        matches = [d for d in devices if wanted.lower() in d["name"].lower()]
+    if len(matches) == 1:
+        return matches
+    if not matches:
+        raise GoveeError(f"no light or group called {wanted!r}")
+    raise GoveeError(f"{wanted!r} matches several lights: " + ", ".join(d["name"] for d in matches))
+
+
+# ---- actions ---------------------------------------------------------------
+
+
+def scene_options(device, cloud, refresh=False):
+    """Scenes for one device: snapshots from the device list, and the scene
+    catalogue, which is cached for a week because it rarely changes."""
+    options = list(device.get("snapshots") or [])
+    if not device.get("cloud") or not cloud or not device["supports"].get("scenes"):
+        return options
+    cached = (load_cache().get("scenes") or {}).get(device["id"]) or {}
+    if not refresh and time.time() - cached.get("fetchedAt", 0) < SCENE_TTL:
+        return cached.get("options", []) + options
+    fetched = cloud.scenes(device)
+    update_file(CACHE_PATH, lambda c: c.setdefault("scenes", {}).update(
+        {device["id"]: {"fetchedAt": time.time(), "options": fetched}}))
+    return fetched + options
+
+
+def find_scene(options, name):
+    wanted = name.strip().lower()
+    for option in options:
+        if option["name"].lower() == wanted:
+            return option
+    partial = [o for o in options if wanted in o["name"].lower()]
+    return partial[0] if len(partial) == 1 else None
+
+
+def cloud_call(cloud, device, action, value):
+    if action == "power":
+        cloud.control(device, "on_off", "powerSwitch", 1 if value else 0)
+    elif action == "brightness":
+        cloud.control(device, "range", "brightness", from_percent(value, device["brightnessRange"]))
+    elif action == "color":
+        r, g, b = value
+        cloud.control(device, "color_setting", "colorRgb", (r << 16) + (g << 8) + b)
+    elif action == "temp":
+        low, high = device["tempRange"]
+        cloud.control(device, "color_setting", "colorTemperatureK", max(low, min(high, value)))
+    elif action == "scene":
+        cloud.control(device, "dynamic_scene", value["instance"], value["value"])
+
+
+def optimistic(action, value, device):
+    if action == "power":
+        return {"power": value}
+    fields = {"power": True}
+    if action == "brightness":
+        fields["brightness"] = value
+    elif action == "color":
+        fields.update(mode="color", color=hex_color(value))
+    elif action == "temp":
+        low, high = device["tempRange"]
+        fields.update(mode="temp", colorTemp=max(low, min(high, value)))
+    elif action == "scene":
+        fields["mode"] = "scene"
+    return fields
+
+
+def supported(device, action):
+    key = {"power": "power", "brightness": "brightness", "color": "color",
+           "temp": "temp", "scene": "scenes"}[action]
+    return device["supports"].get(key, False)
+
+
+def patch_devices(changes, error=None, clear_error=False):
+    """Merge field changes into state.json, under the lock."""
+    def change(state):
+        for device in state.get("devices") or []:
+            if device.get("id") in changes:
+                device.update(changes[device["id"]])
+        config = load_config()
+        state["groups"] = group_view(config, state.get("devices") or [])
+        if error:
+            state["error"] = {"message": error, "at": time.time()}
+        elif clear_error:
+            state["error"] = None
+    update_file(STATE_PATH, change)
+
+
+def apply(target, action, value):
+    """Run one action on a target, LAN first, cloud for the rest.
+
+    `value` may depend on each device (relative brightness, toggle), so it is
+    a function of the device. The state file is updated before the network is
+    touched, so the panel moves at once, and rolled back for any device that
+    failed.
+    """
+    config = load_config()
+    if not is_configured(config):
+        raise GoveeError("not set up yet: run `eld-govee setup`")
+    state = current_state()
+    targets = [d for d in resolve(state, config, target) if supported(d, action)]
+    if not targets:
+        raise GoveeError(f"none of those lights support {action}")
+    cloud = Cloud(api_key(config)) if has_cloud(config) else None
+
+    plan = []
+    for device in targets:
+        device_value = value(device) if callable(value) else value
+        if action == "scene":
+            option = find_scene(scene_options(device, cloud), device_value)
+            if option is None:
+                continue
+            device_value = option
+        plan.append((device, device_value))
+    if not plan:
+        raise GoveeError(f"no scene called {value!r} on those lights")
+
+    before = {d["id"]: {f: d.get(f) for f in FIELDS} for d, _ in plan}
+    patch_devices({d["id"]: optimistic(action, v, d) for d, v in plan})
+
+    failures, done = {}, {}
+    # Setting a level on a light that is off should light it.
+    wake = action != "power"
+
+    lan_plan = [(d, v) for d, v in plan if d.get("ip") and lan_message(action, v)]
+    lan_ids = {d["id"] for d, _ in lan_plan}
+    rest = [(d, v) for d, v in plan if d["id"] not in lan_ids]
+    if lan_plan:
+        try:
+            with Lan() as lan:
+                for device, device_value in lan_plan:
+                    if wake and not device.get("power"):
+                        lan.command(device["ip"], *lan_message("power", True))
+                    lan.command(device["ip"], *lan_message(action, device_value))
+                time.sleep(0.15)
+                answers = lan.status([d["ip"] for d, _ in lan_plan], timeout=0.8)
+            for device, device_value in lan_plan:
+                if device["ip"] in answers:
+                    # The answer proves the light heard us, but it may predate
+                    # the change, so what we asked for wins over what it said.
+                    done[device["id"]] = dict(answers[device["ip"]], **optimistic(action, device_value, device),
+                                              via="lan", updatedAt=time.time())
+                else:
+                    rest.append((device, device_value))
+        except GoveeError:
+            rest.extend(lan_plan)
+
+    def run_cloud(item):
+        device, device_value = item
+        if not cloud or not device.get("cloud"):
+            return device["id"], f"{device['name']} did not answer on the LAN"
+        try:
+            if wake and not device.get("power") and action != "scene":
+                cloud_call(cloud, device, "power", True)
+            cloud_call(cloud, device, action, device_value)
+            return device["id"], None
+        except GoveeError as error:
+            return device["id"], str(error)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for device_id, error in pool.map(run_cloud, rest):
+            if error:
+                failures[device_id] = error
+            else:
+                done[device_id] = {"via": "cloud", "updatedAt": time.time(), "online": True}
+
+    changes = dict(done)
+    for device_id in failures:
+        changes[device_id] = before[device_id]
+    names = {d["id"]: d["name"] for d, _ in plan}
+    message = ""
+    if failures:
+        message = "; ".join(sorted({f"{names[k]}: {v}" if len(plan) > 1 else v
+                                    for k, v in failures.items()}))
+    patch_devices(changes, error=message or None, clear_error=not failures)
+    if failures:
+        raise GoveeError(message)
+    return [names[d["id"]] for d, _ in plan]
+
+
+# ---- commands ------------------------------------------------------------
+
+
+def cmd_setup(args):
+    config = load_config()
+    print("Govee lights setup\n")
+    print("Lights with LAN Control turned on (Govee Home app → device → settings)")
+    print("work locally without a key. For every other light, and for names and")
+    print("scenes, the plugin needs a Govee API key: Govee Home app → Profile →")
+    print("settings (gear) → Apply for API Key. It arrives by email.\n")
+    key = getpass.getpass("API key (leave empty for LAN only): ").strip()
+    result = save_setup(config, key)
+    if result["keyStore"] == "none":
+        print(f"\nLAN only. Found {result['devices']} light(s) on the network.")
+    else:
+        where = "your keyring" if result["keyStore"] == "keyring" else CONFIG_PATH
+        print(f"\nKey accepted and stored in {where}. {result['devices']} device(s) on the account.")
+    if result.get("lanHint"):
+        print("\nNo light answered on the LAN. Your firewall drops their replies; allow them with:")
+        print(f"  {result['lanHint']}")
+
+
+def save_setup(config, key):
+    if key:
+        if not valid_key(key):
+            raise GoveeError("that does not look like a Govee API key")
+        raw = Cloud(key).devices()
+        update_file(CACHE_PATH, lambda c: c.update(devices={"fetchedAt": time.time(), "list": raw}))
+        store = store_key(config, key)
+        config.pop("lanOnly", None)
+    else:
+        if has_cloud(config):
+            store = "keyring" if config.get("keyStore") == "keyring" else "file"
+        else:
+            store = "none"
+            config["lanOnly"] = True
+    save_config(config)
+    state = poll(max_age=0, refresh_devices=bool(key))
+    return {"devices": len(state["devices"]), "keyStore": store, "lanHint": state.get("lanHint", "")}
+
+
+def cmd_setup_save(args):
+    key = "" if args.lan_only else sys.stdin.readline().strip()
+    if not key and not args.lan_only and not has_cloud(load_config()):
+        raise GoveeError("paste the API key, or choose LAN only")
+    print(json.dumps(save_setup(load_config(), key)))
+
+
+def cmd_forget_key(args):
+    config = load_config()
+    if config.get("keyStore") == "keyring":
+        try:
+            keyring_clear()
+        except KeyringUnavailable:
+            pass
+    config.pop("keyStore", None)
+    config.pop("apiKey", None)
+    config.pop("lanOnly", None)
+    save_config(config)
+    update_file(CACHE_PATH, lambda c: (c.pop("devices", None), c.pop("scenes", None)))
+    poll()
+    print("API key removed. Revoke it with Govee too if it may have leaked.")
+
+
+def cmd_poll(args):
+    state = poll(max_age=args.max_age, refresh_devices=args.devices, scan=not args.no_lan)
+    if args.print:
+        print(json.dumps(state, indent=2))
+
+
+def describe(device):
+    if device.get("online") is False:
+        return "offline"
+    parts = ["on" if device.get("power") else "off" if device.get("power") is False else "?"]
+    if device.get("power") and isinstance(device.get("brightness"), int):
+        parts.append(f"{device['brightness']}%")
+    if device.get("power") and device.get("mode") == "temp" and device.get("colorTemp"):
+        parts.append(f"{device['colorTemp']}K")
+    elif device.get("power") and device.get("mode") == "color" and device.get("color"):
+        parts.append(device["color"])
+    return " ".join(parts)
+
+
+def cmd_list(args):
+    state = poll(max_age=args.max_age)
+    if args.json:
+        print(json.dumps(state["devices"], indent=2))
+        return
+    if not state["configured"]:
+        print("Not set up yet: run `eld-govee setup`.")
+        return
+    width = max([len(d["name"]) for d in state["devices"]] + [4])
+    for device in state["devices"]:
+        via = "LAN" if device.get("lan") else "cloud"
+        hidden = "  (hidden)" if device.get("hidden") else ""
+        print(f"{device['name']:<{width}}  {describe(device):<20} {via:<5} {device['sku']}  {device['id']}{hidden}")
+    for group in state["groups"]:
+        print(f"\ngroup {group['name']}: {group['onCount']}/{len(group['members'])} on")
+    for key, label in (("cloudError", "cloud"), ("lanError", "LAN")):
+        if state.get(key):
+            print(f"\n{label}: {state[key]}", file=sys.stderr)
+    if state.get("lanHint"):
+        print(f"\nNo light answered on the LAN. If you expected some, run:\n  {state['lanHint']}", file=sys.stderr)
+
+
+def report(names, what):
+    print(f"{', '.join(names)}: {what}")
+
+
+def cmd_power(args):
+    if args.mode == "toggle":
+        state = current_state()
+        targets = resolve(state, load_config(), args.target)
+        turn_on = not any(d.get("power") for d in targets)
+    else:
+        turn_on = args.mode == "on"
+    report(apply(args.target, "power", turn_on), "on" if turn_on else "off")
+
+
+def cmd_brightness(args):
+    text = args.level.strip().rstrip("%")
+    match = re.fullmatch(r"([+-]?)(\d{1,3})", text)
+    if not match:
+        raise GoveeError("brightness is a percentage: 40, +10 or -10")
+    sign, amount = match.group(1), int(match.group(2))
+
+    def level(device):
+        if not sign:
+            return max(1, min(100, amount))
+        current = device.get("brightness") if isinstance(device.get("brightness"), int) else 50
+        return max(1, min(100, current + (amount if sign == "+" else -amount)))
+
+    report(apply(args.target, "brightness", level), f"brightness {text}%")
+
+
+def cmd_color(args):
+    rgb = parse_color(args.color)
+    report(apply(args.target, "color", rgb), hex_color(rgb))
+
+
+def cmd_temp(args):
+    kelvin = args.kelvin
+    if not 1000 <= kelvin <= 10000:
+        raise GoveeError("colour temperature is in kelvin, e.g. 2700 (warm) to 6500 (cool)")
+    report(apply(args.target, "temp", kelvin), f"{kelvin}K")
+
+
+def cmd_scene(args):
+    report(apply(args.target, "scene", args.scene), f"scene {args.scene}")
+
+
+def cmd_scenes(args):
+    config = load_config()
+    state = current_state()
+    devices = [d for d in resolve(state, config, args.target) if d["supports"].get("scenes")]
+    cloud = Cloud(api_key(config)) if has_cloud(config) else None
+    names, seen = [], set()
+    for device in devices:
+        for option in scene_options(device, cloud, refresh=args.refresh):
+            label = option["name"]
+            if label.lower() not in seen:
+                seen.add(label.lower())
+                names.append({"name": label, "kind": option["kind"]})
+    if args.json:
+        print(json.dumps(names))
+    else:
+        for option in names:
+            print(option["name"] + ("" if option["kind"] == "scene" else f"  ({option['kind']})"))
+
+
+def cmd_group(args):
+    config = load_config()
+    if args.action == "list":
+        for name, members in sorted(config["groups"].items()):
+            print(f"{name}: {len(members)} device(s)")
+        return
+    name = clean_text(args.name, "", 40)
+    if not name or name.lower() == "all":
+        raise GoveeError("give the group a name (not 'all')")
+    existing = next((k for k in config["groups"] if k.lower() == name.lower()), None)
+    if args.action == "remove":
+        if existing is None:
+            raise GoveeError(f"no group called {name!r}")
+        del config["groups"][existing]
+    else:
+        state = current_state()
+        members = []
+        for wanted in args.devices:
+            for device in resolve(state, config, wanted):
+                if device["id"] not in members:
+                    members.append(device["id"])
+        if not members:
+            raise GoveeError("a group needs at least one device")
+        if existing is not None:
+            del config["groups"][existing]
+        config["groups"][name] = members
+    save_config(config)
+    poll(max_age=10**9, scan=False)
+    print(f"group {name}: {'removed' if args.action == 'remove' else 'saved'}")
+
+
+def single_device(target):
+    state = current_state()
+    matches = resolve(state, load_config(), target)
+    if len(matches) != 1:
+        raise GoveeError(f"{target!r} is more than one light")
+    return matches[0]
+
+
+def cmd_rename(args):
+    device = single_device(args.device)
+    config = load_config()
+    name = clean_text(args.name, "", 40)
+    if name:
+        config["aliases"][device["id"]] = name
+    else:
+        config["aliases"].pop(device["id"], None)
+    save_config(config)
+    poll(max_age=10**9, scan=False)
+    print(f"{device['name']} → {name or 'its Govee name'}")
+
+
+def cmd_hide(args, hide=True):
+    device = single_device(args.device)
+    config = load_config()
+    hidden = [d for d in config["hidden"] if d != device["id"]]
+    if hide:
+        hidden.append(device["id"])
+    config["hidden"] = hidden
+    save_config(config)
+    poll(max_age=10**9, scan=False)
+    print(f"{device['name']}: {'hidden' if hide else 'shown'}")
+
+
+def cmd_dismiss(args):
+    update_file(STATE_PATH, lambda s: s.update(error=None))
+
+
+def cmd_doctor(args):
+    ok = True
+
+    def check(good, label, detail=""):
+        nonlocal ok
+        ok = ok and good
+        print(("  ok   " if good else "  FAIL ") + label + (f" — {detail}" if detail else ""))
+
+    config = load_config()
+    check(is_configured(config), "set up", CONFIG_PATH if is_configured(config) else "run `eld-govee setup`")
+    if has_cloud(config):
+        store = "keyring" if config.get("keyStore") == "keyring" else f"file ({CONFIG_PATH})"
+        try:
+            devices = [d for d in map(summarize_cloud, Cloud(api_key(config)).devices()) if d]
+            check(True, f"API key accepted ({store})", f"{len(devices)} controllable device(s)")
+        except GoveeError as error:
+            check(False, f"API key ({store})", str(error))
+        print(f"  info cloud requests today: {usage_today(load_cache())} of {DAILY_LIMIT}")
+    else:
+        print("  info no API key: LAN only")
+    try:
+        with Lan() as lan:
+            found = lan.scan(timeout=2.5)
+        check(True, f"UDP {LAN_LISTEN_PORT} free for LAN replies")
+        print(f"  info {len(found)} light(s) answered on the LAN"
+              + (": " + ", ".join(f"{v['sku']} at {v['ip']}" for v in found.values()) if found else ""))
+        if not found:
+            hint = firewall_hint()
+            if hint:
+                check(False, "firewall lets LAN replies in", f"run: {hint}")
+            else:
+                print("  info turn on LAN Control per light in the Govee Home app, if the model has it")
+    except GoveeError as error:
+        check(False, "LAN", str(error))
+    sys.exit(0 if ok else 1)
+
+
+def notify(message):
+    tool = shutil.which("notify-send")
+    if tool:
+        subprocess.run([tool, "-a", "Govee", "Govee", message], timeout=5, check=False)
+
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    parser = argparse.ArgumentParser(prog="eld-govee", description=__doc__.splitlines()[0])
+    parser.add_argument("--version", action="version", version=f"%(prog)s {plugin_version()}")
+    parser.add_argument("--notify", action="store_true", help="show errors as a desktop notification")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("setup", help="set the API key, or choose LAN only").set_defaults(func=cmd_setup)
+    p = sub.add_parser("setup-save", help="store the API key from stdin (used by the panel)")
+    p.add_argument("--lan-only", action="store_true")
+    p.set_defaults(func=cmd_setup_save)
+    sub.add_parser("forget-key", help="remove the stored API key").set_defaults(func=cmd_forget_key)
+
+    p = sub.add_parser("poll", help="refresh the state file")
+    p.add_argument("--max-age", type=int, default=300, help="re-read cloud state older than this (seconds)")
+    p.add_argument("--devices", action="store_true", help="refresh the device list from the account")
+    p.add_argument("--no-lan", action="store_true")
+    p.add_argument("--print", action="store_true")
+    p.set_defaults(func=cmd_poll)
+    p = sub.add_parser("list", aliases=["status"], help="list lights and groups")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--max-age", type=int, default=60)
+    p.set_defaults(func=cmd_list)
+
+    for mode in ("on", "off", "toggle"):
+        p = sub.add_parser(mode, help=f"turn lights {mode}" if mode != "toggle" else "toggle lights")
+        p.add_argument("target", nargs="?", default="all", help="light, group or 'all' (default)")
+        p.set_defaults(func=cmd_power, mode=mode)
+    p = sub.add_parser("brightness", help="set brightness: 40, +10, -10")
+    p.add_argument("target")
+    p.add_argument("level")
+    p.set_defaults(func=cmd_brightness)
+    p = sub.add_parser("color", help="set a colour: #ff8800 or a name")
+    p.add_argument("target")
+    p.add_argument("color")
+    p.set_defaults(func=cmd_color)
+    p = sub.add_parser("temp", help="set white colour temperature in kelvin")
+    p.add_argument("target")
+    p.add_argument("kelvin", type=int)
+    p.set_defaults(func=cmd_temp)
+    p = sub.add_parser("scene", help="apply a scene by name")
+    p.add_argument("target")
+    p.add_argument("scene")
+    p.set_defaults(func=cmd_scene)
+    p = sub.add_parser("scenes", help="list a light's scenes")
+    p.add_argument("target")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--refresh", action="store_true")
+    p.set_defaults(func=cmd_scenes)
+
+    p = sub.add_parser("group", help="manage groups of lights")
+    group = p.add_subparsers(dest="action", required=True)
+    g = group.add_parser("set", help="create or replace a group")
+    g.add_argument("name")
+    g.add_argument("devices", nargs="+")
+    group.add_parser("list")
+    g = group.add_parser("remove")
+    g.add_argument("name")
+    p.set_defaults(func=cmd_group)
+    p = sub.add_parser("rename", help="give a light a local name (empty to reset)")
+    p.add_argument("device")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_rename)
+    p = sub.add_parser("hide", help="hide a light from the panel and from 'all'")
+    p.add_argument("device")
+    p.set_defaults(func=cmd_hide)
+    p = sub.add_parser("unhide", help="show a hidden light again")
+    p.add_argument("device")
+    p.set_defaults(func=lambda a: cmd_hide(a, hide=False))
+    sub.add_parser("dismiss", help="clear the last error (used by the panel)").set_defaults(func=cmd_dismiss)
+    sub.add_parser("doctor", help="check the setup").set_defaults(func=cmd_doctor)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except GoveeError as error:
+        print(f"eld-govee: {error}", file=sys.stderr)
+        if args.notify:
+            notify(str(error))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    finally:
+        try:
+            flush_usage()
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

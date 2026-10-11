@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "id": "com.eldtechnologies.govee",
+  "name": "Govee Lights",
+  "version": "0.1.0",
+  "author": "ELD Technologies",
+  "license": "MIT",
+  "description": "Control your Govee lights from the Omarchy bar: power, brightness, colour, white temperature, scenes and groups, over the local network first and the Govee cloud when needed.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Govee Lights",
+    "description": "Power, brightness, colour and scenes for Govee lights.",
+    "category": "Home",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refresh": "balanced",
+      "middleClick": "toggle-all",
+      "scrollStep": 10,
+      "showHidden": false
+    },
+    "schema": [
+      {
+        "key": "refresh",
+        "type": "enum",
+        "label": "Background refresh (efficient saves Govee cloud requests)",
+        "options": [
+          "fast",
+          "balanced",
+          "efficient"
+        ],
+        "defaultValue": "balanced"
+      },
+      {
+        "key": "middleClick",
+        "type": "enum",
+        "label": "Middle-click on the bar icon",
+        "options": [
+          "toggle-all",
+          "off-all",
+          "nothing"
+        ],
+        "defaultValue": "toggle-all"
+      },
+      {
+        "key": "scrollStep",
+        "type": "integer",
+        "label": "Brightness step when scrolling on the bar icon (0 turns it off)",
+        "min": 0,
+        "max": 25,
+        "step": 5,
+        "defaultValue": 10
+      },
+      {
+        "key": "showHidden",
+        "type": "boolean",
+        "label": "Show hidden lights in the panel",
+        "defaultValue": false
+      }
+    ]
+  },
+  "homepage": "https://github.com/eldtechnologies/omarchy-plugin-govee"
+}

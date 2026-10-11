@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile the helper
+        run: python -m py_compile bin/eld-govee
+
+      - name: Unit and end-to-end tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+
+      - name: Manifest is valid JSON with the expected entry points
+        run: |
+          python - <<'PY'
+          import json, os
+          m = json.load(open("manifest.json"))
+          assert m["schemaVersion"] == 1, "schemaVersion"
+          assert not m["id"].startswith("omarchy."), "reserved namespace"
+          for path in m["entryPoints"].values():
+              assert os.path.isfile(path), f"missing entry point {path}"
+          print(m["id"], m["version"], "ok")
+          PY
+
+      - name: Shell scripts
+        run: |
+          bash -n install.sh uninstall.sh
+          shellcheck install.sh uninstall.sh
