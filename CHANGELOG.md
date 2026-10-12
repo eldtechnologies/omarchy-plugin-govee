@@ -3,6 +3,62 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-govee --version` reads it from there.
 
+## 0.3.0 — 2026-10-13
+
+Security hardening, after a full review of the plugin before its marketplace
+listing. Nothing found allowed running code, reading the API key or writing
+outside the plugin's own files; these fixes are about what a noisy or
+hostile device on your network, or a broken answer from Govee, could do.
+
+### Security
+
+- A host on your network could add made-up lights by the thousand, and
+  they were remembered for good. Now only replies from a network this
+  machine is directly on count, one light per address, at most 64 per scan.
+  Between scans only lights on your account or remembered ones keep an
+  address, and a light is remembered only after it also answers a status
+  request: for a month, and at most 128 of them. A light claimed from two
+  addresses is not trusted on the LAN.
+- A malformed packet or cloud answer could crash a refresh or a command,
+  and a crash mid-command left the panel showing a change that never
+  happened. Everything from the network is now type-checked, and a command
+  that fails, is stopped or runs out of time rolls back exactly the lights
+  it did not change.
+- Every helper run has an overall time limit, and the panel stops any run
+  that hangs, so a dead network can no longer stall it.
+- The LAN reply port is no longer shared (`SO_REUSEADDR`), so another
+  program on it is reported instead of silently taking the replies.
+- A locked keyring or a dismissed unlock prompt is now an error; the key
+  only goes to the config file when there is no keyring at all. Removing
+  the key reports failure instead of claiming success. Demo mode can no
+  longer change the real key.
+- Files are created private from the start, never through a planted link,
+  and temporary files are cleaned up. Theme files are read as bounded
+  bytes, and only if they are regular files.
+- Light names reach `notify-send` and the helper's command line as text,
+  never as options or markup.
+- Changes to `config.json` are serialised (without holding the lock over
+  the network), so quick clicks cannot lose a group or a name, and a slow
+  refresh no longer overwrites a newer result.
+- The theme hook runs the installed plugin's own copy, never a `PATH`
+  lookup, and older hooks are rewritten. `install.sh` and `uninstall.sh`
+  never replace or delete files that are not the plugin's. CI actions are
+  pinned to commits.
+
+### Added
+
+- `eld-govee forget <light>` (or `--offline` for all that are gone) and a
+  **Forget** button, for LAN-only lights.
+- The panel shows local network errors, such as another program holding
+  the LAN port.
+
+### Changed
+
+- The firewall hint no longer guesses a subnet when it cannot read yours,
+  and says that the rule is permanent and covers the whole subnet.
+- README: how to remove everything after `omarchy plugin remove`; SECURITY.md
+  describes the theme hook, the LAN limits and the key handling exactly.
+
 ## 0.2.1 — 2026-10-12
 
 ### Fixed

@@ -12,6 +12,7 @@ import contextlib
 import fcntl
 import getpass
 import html
+import http.client
 import ipaddress
 import json
 import os
@@ -21,6 +22,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -33,13 +35,23 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 HOME = os.path.expanduser("~")
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "eld-govee")
+
+
+def _xdg(name, fallback):
+    """An XDG base directory; relative values are invalid by the spec."""
+    value = os.environ.get(name, "")
+    return value if os.path.isabs(value) else fallback
+
+
+CONFIG_DIR = os.path.join(_xdg("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "eld-govee")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "eld-govee")
+STATE_DIR = os.path.join(_xdg("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")), "eld-govee")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 CACHE_PATH = os.path.join(STATE_DIR, "cache.json")
 STATE_LOCK = os.path.join(STATE_DIR, "state.lock")
 LAN_LOCK = os.path.join(STATE_DIR, "lan.lock")
+CONFIG_LOCK = os.path.join(STATE_DIR, "config.lock")
+THEME_LOCK = os.path.join(STATE_DIR, "theme.lock")
 # Omarchy keeps the current theme, and runs theme-set hooks, from fixed places
 # under $HOME, whatever the XDG variables say.
 OMARCHY_THEME_DIR = os.path.join(HOME, ".local", "state", "omarchy", "current", "theme")
@@ -57,35 +69,55 @@ if DEMO:
     CACHE_PATH = os.path.join(DEMO_DIR, "cache.json")
 
 
-def _loopback_only(value):
+def _is_loopback(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _loopback_url(value):
     """Test hooks may only point at this machine, so a stray environment
     variable can never send the API key or commands somewhere else."""
-    host = urllib.parse.urlsplit(value if "//" in value else "//" + value).hostname or ""
-    return host in ("127.0.0.1", "localhost", "::1")
+    try:
+        url = urllib.parse.urlsplit(value)
+        return (url.scheme == "http" and "@" not in url.netloc and url.port is not None
+                and _is_loopback(url.hostname or ""))
+    except ValueError:
+        return False
 
 
 API_BASE = "https://openapi.api.govee.com/router/api/v1"
 _test_api = os.environ.get("ELD_GOVEE_TEST_API_BASE", "")
-if _test_api and _loopback_only(_test_api):
+if _test_api and _loopback_url(_test_api):
     API_BASE = _test_api.rstrip("/")
 
 # Govee LAN API: discovery goes to a multicast group on 4001, devices answer
 # on 4002, and take commands on 4003.
 LAN_SCAN_ADDR, LAN_SCAN_PORT, LAN_LISTEN_PORT, LAN_CONTROL_PORT = "239.255.255.250", 4001, 4002, 4003
 _test_lan = os.environ.get("ELD_GOVEE_TEST_LAN", "")  # "127.0.0.1:scan:listen:control"
-if _test_lan and _loopback_only(_test_lan.split(":")[0]):
-    _parts = _test_lan.split(":")
-    LAN_SCAN_ADDR = _parts[0]
-    LAN_SCAN_PORT, LAN_LISTEN_PORT, LAN_CONTROL_PORT = (int(p) for p in _parts[1:4])
+LAN_TEST = False
+if _test_lan.count(":") == 3 and _is_loopback(_test_lan.split(":")[0]):
+    with contextlib.suppress(ValueError):
+        _parts = _test_lan.split(":")
+        LAN_SCAN_PORT, LAN_LISTEN_PORT, LAN_CONTROL_PORT = (int(p) for p in _parts[1:4])
+        LAN_SCAN_ADDR, LAN_TEST = _parts[0], True
 
 DAILY_LIMIT = 10000  # Govee's documented per-account cloud quota
 DEVICE_LIST_TTL = 12 * 3600
 SCENE_TTL = 7 * 86400
 LAN_IP_TTL = 15 * 60
 MAX_RESPONSE = 4 * 1024 * 1024
+CLOUD_DEADLINE = 20  # seconds for one whole cloud request, however slowly it trickles in
+# A LAN light answers a scan from its own address. Bound what one scan, and
+# the list of lights remembered between scans, can hold, so a noisy or
+# hostile host on the network cannot flood the panel with made-up lights.
+MAX_SCAN_DEVICES = 64
+MAX_LAN_KNOWN = 128
+LAN_KNOWN_TTL = 30 * 86400
 
 DEVICE_ID = re.compile(r"[0-9A-F]{2}(?::[0-9A-F]{2}){5,7}")
-SKU = re.compile(r"[A-Za-z0-9_-]{1,24}")
+SKU = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,23}")
 
 COLOR_NAMES = {
     "red": "ff0000", "orange": "ff7a00", "yellow": "ffd000", "green": "00ff40",
@@ -108,17 +140,40 @@ class GoveeError(Exception):
     pass
 
 
+class TimedOut(GoveeError):
+    pass
+
+
+# Every run has a deadline, a little under the panel's watchdog, so a stuck
+# network ends in a clean rollback and an error rather than a kill.
+RUN_LIMITS = {"setup-save": 80, "demo": 75, "doctor": 60, "setup": 0}
+RUN_LIMIT = 50
+
+
+def _timed_out(signum, frame):
+    raise TimedOut("took too long; gave up")
+
+
 # ---- files ---------------------------------------------------------------
 
 
 def write_atomic(path, data, mode=0o600):
-    directory = os.path.dirname(path)
+    """Replace a file in one step. The temporary file is created with its
+    final mode, never follows a planted link, starts with a dot (so a hooks
+    directory never runs a half-written one) and is removed on failure."""
+    directory, name = os.path.split(path)
     os.makedirs(directory, mode=0o700, exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-    with open(tmp, "wb") as handle:
-        handle.write(data if isinstance(data, bytes) else data.encode())
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    tmp = os.path.join(directory, f".{name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode & 0o700)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data if isinstance(data, bytes) else data.encode())
+            os.fchmod(handle.fileno(), mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def write_json(path, value):
@@ -183,6 +238,23 @@ def hex_color(rgb):
     return "#%02x%02x%02x" % tuple(max(0, min(255, int(c))) for c in rgb)
 
 
+def read_theme_file(name, limit):
+    """A small text file from the current theme, or "". Themes come from
+    anywhere, so only a regular file, read in bounded bytes."""
+    try:
+        fd = os.open(os.path.join(OMARCHY_THEME_DIR, name), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return ""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return os.read(fd, limit).decode("ascii", "replace")
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+
+
 def theme_color():
     """The current Omarchy theme's colour for lights, or None.
 
@@ -191,16 +263,9 @@ def theme_color():
     the accent. It is scaled to full strength, because brightness is set on
     its own and a muted accent would otherwise make a dim, grey light.
     """
-    value = ""
-    with contextlib.suppress(OSError):
-        with open(os.path.join(OMARCHY_THEME_DIR, "keyboard.rgb")) as handle:
-            value = handle.read(64).strip().lstrip("#")
+    value = read_theme_file("keyboard.rgb", 64).strip().lstrip("#")
     if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
-        try:
-            with open(os.path.join(OMARCHY_THEME_DIR, "colors.toml")) as handle:
-                match = re.search(r'^\s*accent\s*=\s*"#?([0-9a-fA-F]{6})"', handle.read(65536), re.M)
-        except OSError:
-            return None
+        match = re.search(r'^\s*accent\s*=\s*"#?([0-9a-fA-F]{6})"', read_theme_file("colors.toml", 65536), re.M)
         if not match:
             return None
         value = match.group(1)
@@ -226,17 +291,28 @@ class KeyringUnavailable(Exception):
     pass
 
 
+class NoKeyring(KeyringUnavailable):
+    """No keyring on this system at all, as opposed to one that is locked,
+    timed out or refused: only then may the key go to the config file."""
+
+
+# What secret-tool says when no Secret Service is running on the session bus.
+NO_SECRET_SERVICE = re.compile(r"org\.freedesktop\.secrets was not provided by any|ServiceUnknown|"
+                               r"Cannot autolaunch D-Bus|Cannot spawn a message bus|DBUS_SESSION_BUS_ADDRESS")
+
+
 def _secret_tool(args, secret=None):
     tool = shutil.which("secret-tool")
     if not tool:
-        raise KeyringUnavailable("secret-tool is not installed (package libsecret)")
+        raise NoKeyring("secret-tool is not installed (package libsecret)")
     try:
         result = subprocess.run([tool, *args], input=secret, capture_output=True,
                                 text=True, timeout=10)
     except subprocess.TimeoutExpired:
         raise KeyringUnavailable("the keyring did not answer; is it locked?")
     if result.returncode != 0 and result.stderr.strip():
-        raise KeyringUnavailable(result.stderr.strip().splitlines()[-1])
+        reason = clean_text(result.stderr.strip().splitlines()[-1], "", 160)
+        raise (NoKeyring if NO_SECRET_SERVICE.search(result.stderr) else KeyringUnavailable)(reason)
     return result
 
 
@@ -256,8 +332,11 @@ def keyring_lookup():
 
 
 def keyring_clear():
+    """Remove every key this plugin stored, whatever its account attribute."""
     _key_cache.pop("default", None)
-    _secret_tool(["clear", "service", KEYRING_SERVICE, "account", "default"])
+    result = _secret_tool(["clear", "service", KEYRING_SERVICE])
+    if result.returncode != 0:
+        raise KeyringUnavailable("the keyring did not remove the key")
 
 
 def load_config():
@@ -270,10 +349,26 @@ def load_config():
         raise GoveeError(f"cannot read {CONFIG_PATH}: {error}")
     if not isinstance(config, dict):
         config = {}
-    for name, empty in (("groups", {}), ("aliases", {}), ("hidden", []), ("followTheme", [])):
-        if not isinstance(config.get(name), type(empty)):
-            config[name] = empty
+    # The file is the user's to edit: keep only entries of the right shape.
+    config["groups"] = {clean_text(name, "", 40): [m for m in as_list(members) if norm_id(m) == m]
+                        for name, members in as_dict(config.get("groups")).items() if clean_text(name, "", 40)}
+    config["aliases"] = {k: clean_text(v, "", 40) for k, v in as_dict(config.get("aliases")).items()
+                         if norm_id(k) == k and isinstance(v, str) and clean_text(v, "", 40)}
+    config["hidden"] = [k for k in as_list(config.get("hidden")) if isinstance(k, str) and norm_id(k) == k]
+    config["followTheme"] = [k for k in as_list(config.get("followTheme")) if isinstance(k, str)]
     return config
+
+
+@contextlib.contextmanager
+def editing_config():
+    """Read, change and save config.json under one lock, so two quick clicks
+    in the panel cannot lose each other's change. Hold it only for the edit,
+    never across the network. Readers need no lock: the file is always
+    replaced in one step. Nothing is saved if the edit raises."""
+    with locked(CONFIG_LOCK):
+        config = load_config()
+        yield config
+        save_config(config)
 
 
 def save_config(config):
@@ -307,10 +402,14 @@ def store_key(config, key):
         config["keyStore"] = "keyring"
         config.pop("apiKey", None)
         return "keyring"
-    except KeyringUnavailable:
+    except NoKeyring:
         config.pop("keyStore", None)
         config["apiKey"] = key
         return "file"
+    except KeyringUnavailable as error:
+        # A locked keyring, a dismissed prompt or a timeout is not "no
+        # keyring": say so rather than quietly writing the key to a file.
+        raise GoveeError(f"the keyring did not store the key: {error}")
 
 
 def valid_key(key):
@@ -327,7 +426,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_opener = urllib.request.build_opener(_NoRedirect)
+# Proxy settings are honoured for the real API, never for the loopback test
+# base, which must not carry a key anywhere else.
+_opener = (urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+           if API_BASE != "https://openapi.api.govee.com/router/api/v1" else urllib.request.build_opener(_NoRedirect))
 _usage_lock = threading.Lock()
 _usage = {"requests": 0}
 
@@ -335,6 +437,23 @@ _usage = {"requests": 0}
 def count_request():
     with _usage_lock:
         _usage["requests"] += 1
+
+
+def read_bounded(response, deadline):
+    """The body, in chunks, capped in size and in total time: a socket
+    timeout alone lets a server that trickles a byte at a time hold a request
+    open indefinitely."""
+    chunks, size = [], 0
+    while True:
+        if time.monotonic() > deadline:
+            raise GoveeError("the Govee cloud took too long to answer")
+        chunk = response.read1(65536) if hasattr(response, "read1") else response.read(65536)
+        if not chunk:
+            return b"".join(chunks)
+        size += len(chunk)
+        if size > MAX_RESPONSE:
+            raise GoveeError("the Govee cloud sent an answer that is too large")
+        chunks.append(chunk)
 
 
 class Cloud:
@@ -350,9 +469,10 @@ class Cloud:
             "User-Agent": f"eld-govee/{plugin_version()}",
         })
         count_request()
+        deadline = time.monotonic() + CLOUD_DEADLINE
         try:
             with _opener.open(request, timeout=self.timeout) as response:
-                raw = response.read(MAX_RESPONSE)
+                raw = read_bounded(response, deadline)
         except urllib.error.HTTPError as error:
             if error.code in (401, 403):
                 raise GoveeError("the Govee API key was rejected")
@@ -362,15 +482,15 @@ class Cloud:
             try:
                 body = json.loads(error.read(65536))
                 detail = clean_text(body.get("msg") or body.get("message"), "", 120)
-            except (ValueError, AttributeError, OSError):
+            except (ValueError, AttributeError, OSError, RecursionError, http.client.HTTPException):
                 pass
             raise GoveeError(f"Govee cloud error {error.code}" + (f": {detail}" if detail else ""))
-        except (urllib.error.URLError, OSError) as error:
-            reason = getattr(error, "reason", error)
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+            reason = clean_text(getattr(error, "reason", error), "connection failed", 160)
             raise GoveeError(f"cannot reach the Govee cloud: {reason}")
         try:
             payload = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise GoveeError("unexpected answer from the Govee cloud")
         if not isinstance(payload, dict):
             raise GoveeError("unexpected answer from the Govee cloud")
@@ -383,16 +503,15 @@ class Cloud:
         return payload
 
     def devices(self):
-        data = self.request("GET", "/user/devices").get("data")
-        return data if isinstance(data, list) else []
+        return [d for d in as_list(self.request("GET", "/user/devices").get("data")) if isinstance(d, dict)]
 
     def _device_payload(self, device):
         return {"requestId": str(uuid.uuid4()),
                 "payload": {"sku": device["sku"], "device": device["id"]}}
 
     def state(self, device):
-        payload = self.request("POST", "/device/state", self._device_payload(device)).get("payload") or {}
-        return payload.get("capabilities") or []
+        payload = as_dict(self.request("POST", "/device/state", self._device_payload(device)).get("payload"))
+        return as_list(payload.get("capabilities"))
 
     def control(self, device, cap_type, instance, value):
         body = self._device_payload(device)
@@ -409,26 +528,57 @@ class Cloud:
                 if kind == "diy":
                     continue  # plenty of devices have no DIY scenes
                 raise
-            for cap in payload.get("capabilities") or []:
-                for option in (cap.get("parameters") or {}).get("options") or []:
-                    name = clean_text(option.get("name"))
-                    if name and option.get("value") is not None:
-                        options.append({"name": name, "kind": kind, "instance": cap.get("instance"),
-                                        "value": option["value"]})
-        return options
+            for cap in as_list(as_dict(payload).get("capabilities")):
+                instance = as_dict(cap).get("instance")
+                if instance not in SCENE_INSTANCES:
+                    continue
+                for option in as_list(as_dict(as_dict(cap).get("parameters")).get("options")):
+                    option = as_dict(option)
+                    name, value = clean_text(option.get("name")), scene_value(option.get("value"))
+                    if name and value is not None:
+                        options.append({"name": name, "kind": kind, "instance": instance, "value": value})
+        return options[:500]
+
+
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value):
+    return value if isinstance(value, list) else []
+
+
+def as_int(value, low, high):
+    """An int within [low, high], or None. JSON true is not 1 here."""
+    if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+        return value
+    return None
+
+
+SCENE_INSTANCES = ("lightScene", "diyScene", "snapshot")
+
+
+def scene_value(value):
+    """A scene's value is sent back to Govee as is, so only accept the shapes
+    Govee uses: a number, or a small object of numbers."""
+    if as_int(value, 0, 2**53) is not None:
+        return value
+    if isinstance(value, dict) and 0 < len(value) <= 4 and all(
+            isinstance(k, str) and len(k) <= 32 and as_int(v, 0, 2**53) is not None for k, v in value.items()):
+        return value
+    return None
 
 
 def cap_key(cap):
+    cap = as_dict(cap)
     return str(cap.get("type", "")).rsplit(".", 1)[-1], str(cap.get("instance", ""))
 
 
 def cap_range(parameters, fallback):
-    span = (parameters or {}).get("range") or {}
-    try:
-        low, high = int(span.get("min", fallback[0])), int(span.get("max", fallback[1]))
-        return [low, high] if low < high else list(fallback)
-    except (TypeError, ValueError):
-        return list(fallback)
+    span = as_dict(as_dict(parameters).get("range"))
+    low = as_int(span.get("min", fallback[0]), 0, 100000)
+    high = as_int(span.get("max", fallback[1]), 0, 100000)
+    return [low, high] if low is not None and high is not None and low < high else list(fallback)
 
 
 def summarize_cloud(raw):
@@ -438,16 +588,16 @@ def summarize_cloud(raw):
     device_id, sku = norm_id(raw.get("device")), norm_sku(raw.get("sku"))
     if not device_id or not sku:
         return None
-    caps = {cap_key(c): c.get("parameters") or {} for c in raw.get("capabilities") or []
+    caps = {cap_key(c): as_dict(c.get("parameters")) for c in as_list(raw.get("capabilities"))
             if isinstance(c, dict)}
     if ("on_off", "powerSwitch") not in caps:
         return None
     snapshots = []
-    for option in (caps.get(("dynamic_scene", "snapshot")) or {}).get("options") or []:
-        name = clean_text(option.get("name"))
-        if name and option.get("value") is not None:
-            snapshots.append({"name": name, "kind": "snapshot", "instance": "snapshot",
-                              "value": option["value"]})
+    for option in as_list(as_dict(caps.get(("dynamic_scene", "snapshot"))).get("options"))[:100]:
+        option = as_dict(option)
+        name, value = clean_text(option.get("name")), scene_value(option.get("value"))
+        if name and value is not None:
+            snapshots.append({"name": name, "kind": "snapshot", "instance": "snapshot", "value": value})
     return {
         "id": device_id,
         "sku": sku,
@@ -471,24 +621,25 @@ def summarize_cloud(raw):
 def read_cloud_state(capabilities, device):
     """Turn /device/state capabilities into our fields."""
     values = {}
-    for cap in capabilities:
+    for cap in as_list(capabilities):
         if isinstance(cap, dict):
-            values[cap_key(cap)] = (cap.get("state") or {}).get("value")
+            values[cap_key(cap)] = as_dict(cap.get("state")).get("value")
     out = {}
     online = values.get(("online", "online"))
     if isinstance(online, bool):
         out["online"] = online
-    power = values.get(("on_off", "powerSwitch"))
-    if isinstance(power, int):
+    power = as_int(values.get(("on_off", "powerSwitch")), 0, 1)
+    if power is not None:
         out["power"] = power == 1
-    level = values.get(("range", "brightness"))
-    if isinstance(level, int):
-        out["brightness"] = to_percent(level, device.get("brightnessRange") or [1, 100])
-    temp = values.get(("color_setting", "colorTemperatureK"))
-    rgb = values.get(("color_setting", "colorRgb"))
-    if isinstance(temp, int) and temp > 0:
+    span = device.get("brightnessRange") or [1, 100]
+    level = as_int(values.get(("range", "brightness")), 0, 100000)
+    if level is not None:
+        out["brightness"] = to_percent(level, span)
+    temp = as_int(values.get(("color_setting", "colorTemperatureK")), 1000, 10000)
+    rgb = as_int(values.get(("color_setting", "colorRgb")), 0, 0xFFFFFF)
+    if temp is not None:
         out["mode"], out["colorTemp"] = "temp", temp
-    elif isinstance(rgb, int) and rgb >= 0:
+    elif rgb is not None:
         out["mode"], out["color"] = "color", hex_color(((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255))
     return out
 
@@ -514,16 +665,58 @@ def from_percent(percent, span):
 # replies.
 
 
+_networks = []
+
+
+def local_networks():
+    """The IPv4 networks this machine is directly on, from `ip`."""
+    if not _networks:
+        try:
+            out = subprocess.run(["ip", "-j", "-4", "addr", "show"], capture_output=True, text=True, timeout=3).stdout
+            for link in as_list(json.loads(out or "[]")):
+                for info in as_list(as_dict(link).get("addr_info")):
+                    info = as_dict(info)
+                    with contextlib.suppress(ValueError, TypeError):
+                        net = ipaddress.ip_interface(f"{info['local']}/{info['prefixlen']}").network
+                        if not net.is_loopback:
+                            _networks.append(net)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            pass
+        _networks.append(None)  # looked, whatever was found
+    return [n for n in _networks if n is not None]
+
+
+def lan_source_ok(ip):
+    """Lights live on a network this machine is directly on. Anything else is
+    not a light, wherever it claims to be from. Without `ip`, private and
+    link-local addresses count."""
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return LAN_TEST
+    if address.version != 4 or address.is_multicast or address.is_unspecified:
+        return False
+    networks = local_networks()
+    if networks:
+        return any(address in net and (net.prefixlen >= 31 or address not in (net.network_address, net.broadcast_address))
+                   for net in networks)
+    return address.is_private or address.is_link_local
+
+
 class Lan:
     def __init__(self):
         self.sock = None
+        self.conflicts = set()
 
     def __enter__(self):
         self._lock = locked(LAN_LOCK)
         self._lock.__enter__()
         try:
+            # No SO_REUSEADDR: another program, or another user, already on
+            # this port should be an error, not a silent theft of the replies.
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
             sock.bind(("", LAN_LISTEN_PORT))
             self.sock = sock
@@ -539,7 +732,10 @@ class Lan:
 
     def _send(self, address, port, cmd, data):
         message = json.dumps({"msg": {"cmd": cmd, "data": data}}).encode()
-        self.sock.sendto(message, (address, port))
+        try:
+            self.sock.sendto(message, (address, port))
+        except OSError as error:
+            raise GoveeError(f"cannot send on the local network: {error.strerror or error}")
 
     def _receive(self, deadline):
         """Yield (ip, cmd, data) until the deadline."""
@@ -552,33 +748,53 @@ class Lan:
                 raw, (ip, _port) = self.sock.recvfrom(4096)
             except (socket.timeout, OSError):
                 return
-            try:
-                msg = json.loads(raw).get("msg") or {}
-                yield ip, str(msg.get("cmd", "")), msg.get("data") or {}
-            except (ValueError, AttributeError):
+            if not lan_source_ok(ip):
                 continue
+            try:
+                packet = json.loads(raw)
+            except (ValueError, RecursionError):
+                continue
+            msg = as_dict(as_dict(packet).get("msg"))
+            cmd, data = msg.get("cmd"), msg.get("data")
+            if isinstance(cmd, str) and isinstance(data, dict):
+                yield ip, cmd, data
 
     def scan(self, timeout=1.6):
         """{device_id: {"ip", "sku"}} for every device with LAN Control on."""
-        found = {}
+        found, by_ip, conflicts = {}, {}, set()
         for _ in range(2):  # UDP: ask twice in case the first is lost
             self._send(LAN_SCAN_ADDR, LAN_SCAN_PORT, "scan", {"account_topic": "reserve"})
         for ip, cmd, data in self._receive(time.monotonic() + timeout):
+            if cmd != "scan":
+                continue
             device_id, sku = norm_id(data.get("device")), norm_sku(data.get("sku"))
+            if not device_id or not sku:
+                continue
             # The address we act on is the one the reply came from, never one
-            # named inside the payload.
-            if cmd == "scan" and device_id and sku:
-                found[device_id] = {"ip": ip, "sku": sku}
-        return found
+            # named inside the payload. One light per address; an id claimed
+            # from two addresses is not trusted on the LAN this time (the
+            # cloud, if there is one, takes it).
+            if by_ip.get(ip, device_id) != device_id:
+                continue
+            if device_id in found and found[device_id]["ip"] != ip:
+                conflicts.add(device_id)
+            elif device_id not in found and len(found) >= MAX_SCAN_DEVICES:
+                continue
+            by_ip[ip] = device_id
+            found[device_id] = {"ip": ip, "sku": sku}
+        self.conflicts = conflicts
+        return {k: v for k, v in found.items() if k not in conflicts}
 
     def command(self, ip, cmd, data):
         self._send(ip, LAN_CONTROL_PORT, cmd, data)
 
     def status(self, ips, timeout=1.0):
         """{ip: fields} for the devices that answered devStatus."""
-        wanted = set(ips)
-        for ip in wanted:
-            self._send(ip, LAN_CONTROL_PORT, "devStatus", {})
+        wanted = set()
+        for ip in set(ips):
+            with contextlib.suppress(GoveeError):  # one unroutable address is that light's miss
+                self._send(ip, LAN_CONTROL_PORT, "devStatus", {})
+                wanted.add(ip)
         answers = {}
         for ip, cmd, data in self._receive(time.monotonic() + timeout):
             if cmd == "devStatus" and ip in wanted:
@@ -670,6 +886,8 @@ class DemoCloud:
 
 
 class DemoLan:
+    conflicts = frozenset()
+
     def __enter__(self):
         return self
 
@@ -713,18 +931,18 @@ if DEMO:
 
 def read_lan_state(data):
     out = {"online": True}
-    if isinstance(data.get("onOff"), int):
-        out["power"] = data["onOff"] == 1
-    if isinstance(data.get("brightness"), int):
-        out["brightness"] = max(0, min(100, data["brightness"]))
-    temp, color = data.get("colorTemInKelvin"), data.get("color")
-    if isinstance(temp, int) and temp > 0:
+    power = as_int(data.get("onOff"), 0, 1)
+    if power is not None:
+        out["power"] = power == 1
+    level = as_int(data.get("brightness"), 0, 100)
+    if level is not None:
+        out["brightness"] = level
+    temp, color = as_int(data.get("colorTemInKelvin"), 1000, 10000), as_dict(data.get("color"))
+    rgb = [as_int(color.get(c), 0, 255) for c in ("r", "g", "b")]
+    if temp is not None:
         out["mode"], out["colorTemp"] = "temp", temp
-    elif isinstance(color, dict):
-        try:
-            out["mode"], out["color"] = "color", hex_color((color["r"], color["g"], color["b"]))
-        except (KeyError, TypeError, ValueError):
-            pass
+    elif None not in rgb:
+        out["mode"], out["color"] = "color", hex_color(rgb)
     return out
 
 
@@ -775,7 +993,11 @@ def firewall_hint():
                     return ""
         except OSError:
             pass
-    subnet = local_subnet() or "192.168.0.0/16"
+    # Only ever the subnet we are on, read from the routing table and
+    # rebuilt by ipaddress, so the command holds nothing from the network.
+    subnet = local_subnet()
+    if not subnet:
+        return ""
     return f"sudo ufw allow from {subnet} to any port {LAN_LISTEN_PORT} proto udp comment 'Govee LAN'"
 
 
@@ -815,10 +1037,10 @@ def flush_usage():
         return
 
     def change(cache):
-        usage = cache.get("usage") if isinstance(cache.get("usage"), dict) else {}
-        if usage.get("day") != today():
+        usage = as_dict(cache.get("usage"))
+        if usage.get("day") != today() or as_int(usage.get("count"), 0, 10**9) is None:
             usage = {"day": today(), "count": 0}
-        usage["count"] = int(usage.get("count", 0)) + count
+        usage["count"] += count
         cache["usage"] = usage
 
     cache = update_file(CACHE_PATH, change)
@@ -830,20 +1052,20 @@ def flush_usage():
 
 
 def usage_today(cache):
-    usage = cache.get("usage") or {}
-    return int(usage.get("count", 0)) if usage.get("day") == today() else 0
+    usage = as_dict(cache.get("usage"))
+    return (as_int(usage.get("count"), 0, 10**9) or 0) if usage.get("day") == today() else 0
 
 
 def build_registry(config, cache, lan_found):
     """Every known device, keyed by id: the cloud list, plus LAN-only finds."""
     registry = {}
-    for raw in (cache.get("devices") or {}).get("list") or []:
+    for raw in as_list(as_dict(cache.get("devices")).get("list")):
         device = summarize_cloud(raw)
         if device:
             registry[device["id"]] = device
     # LAN-only lights seen before stay listed, offline, instead of vanishing.
-    for device_id, sku in (cache.get("lanKnown") or {}).items():
-        if device_id not in registry and norm_id(device_id) and norm_sku(sku):
+    for device_id, sku in lan_known(cache).items():
+        if device_id not in registry:
             registry[device_id] = lan_only_device(device_id, sku)
     for device_id, info in lan_found.items():
         if device_id not in registry:
@@ -854,6 +1076,21 @@ def build_registry(config, cache, lan_found):
         device["name"] = alias or device["cloudName"]
         device["hidden"] = device["id"] in config["hidden"]
     return registry
+
+
+def lan_known(cache):
+    """{id: sku} for LAN lights seen recently enough to keep listing, at most
+    MAX_LAN_KNOWN. Older caches stored just the SKU; those count as half
+    expired, so a flood remembered by an old version wears off."""
+    now, known = time.time(), []
+    for device_id, entry in as_dict(cache.get("lanKnown")).items():
+        entry = {"sku": entry, "seenAt": now - LAN_KNOWN_TTL / 2} if isinstance(entry, str) else as_dict(entry)
+        seen = entry.get("seenAt")
+        if (norm_id(device_id) == device_id and norm_sku(entry.get("sku"))
+                and isinstance(seen, (int, float)) and now - seen < LAN_KNOWN_TTL):
+            known.append((seen, device_id, entry["sku"]))
+    known.sort(reverse=True)
+    return {device_id: sku for _seen, device_id, sku in known[:MAX_LAN_KNOWN]}
 
 
 def lan_ips(cache, scanned):
@@ -928,6 +1165,7 @@ def compose_state(config, registry, previous, fresh, cache, extra):
 def poll(max_age=300, refresh_devices=False, scan=True):
     """Refresh the device list (rarely), the LAN (always) and cloud state
     for devices the LAN cannot answer for (only when older than max_age)."""
+    started = time.time()
     config = load_config()
     cache = load_cache()
     previous = read_json(STATE_PATH, {})
@@ -950,32 +1188,49 @@ def poll(max_age=300, refresh_devices=False, scan=True):
         except GoveeError as error:
             extra["cloudError"] = str(error)
 
+    # Lights we already trust: on the account, or remembered after answering.
+    # Only they keep an address between scans; anything else must answer the
+    # scan in hand, which holds at most MAX_SCAN_DEVICES.
+    trusted = {d["id"] for d in map(summarize_cloud, as_list(as_dict(cache.get("devices")).get("list"))) if d}
+    trusted |= set(lan_known(cache))
     reachable, lan_status = {}, {}
     if scan:
         try:
             with Lan() as lan:
                 scanned = lan.scan()
-                ips = lan_ips(cache, scanned)
+                # An id claimed from two addresses loses its cached one too,
+                # so an impostor cannot hold on to a real light's id.
+                ips = {k: v for k, v in lan_ips(cache, scanned).items()
+                       if (k in scanned or k in trusted) and k not in lan.conflicts}
                 by_ip = {v["ip"]: k for k, v in ips.items()}
                 for ip, fields in lan.status(list(by_ip)).items():
                     lan_status[by_ip[ip]] = dict(fields, via="lan")
             reachable = {k: v for k, v in ips.items() if k in lan_status or k in scanned}
 
             def remember(c):
-                c["lan"] = {k: dict(v, seenAt=time.time()) if k in lan_status else v for k, v in ips.items()}
-                known = c.get("lanKnown") if isinstance(c.get("lanKnown"), dict) else {}
-                known.update({k: v["sku"] for k, v in reachable.items()})
-                c["lanKnown"] = known
+                now = time.time()
+                c["lan"] = {k: dict(v, seenAt=now) if k in lan_status else v
+                            for k, v in ips.items() if k in lan_status or k in trusted}
+                # Only a light that also answered devStatus from its own
+                # address is remembered, for a month, and at most
+                # MAX_LAN_KNOWN of them: those answering now first, then the
+                # most recently seen.
+                stored = as_dict(c.get("lanKnown"))
+                known = {k: {"sku": sku, "seenAt": as_dict(stored.get(k)).get("seenAt", now - LAN_KNOWN_TTL / 2)}
+                         for k, sku in lan_known(c).items()}
+                known.update({k: {"sku": ips[k]["sku"], "seenAt": now} for k in lan_status})
+                ranked = sorted(known.items(), key=lambda kv: (kv[0] not in lan_status, -kv[1]["seenAt"]))
+                c["lanKnown"] = dict(ranked[:MAX_LAN_KNOWN])
 
             cache = update_file(CACHE_PATH, remember)
         except GoveeError as error:
             extra["lanError"] = str(error)
-        if not reachable:
+        if not reachable and not extra["lanError"]:
             extra["lanHint"] = firewall_hint()
     else:
         # No scan this time (a rename, a group edit): keep the addresses seen
         # recently, or LAN lights would drop to the cloud until the next scan.
-        reachable = lan_ips(cache, {})
+        reachable = {k: v for k, v in lan_ips(cache, {}).items() if k in trusted}
 
     registry = build_registry(config, cache, reachable)
     fresh = dict(lan_status)
@@ -1003,6 +1258,12 @@ def poll(max_age=300, refresh_devices=False, scan=True):
 
     with locked(STATE_LOCK):
         previous = read_json(STATE_PATH, {})
+        # A command that finished while this poll was out on the network
+        # knows better than readings taken before it.
+        newer = {d.get("id") for d in as_list(previous.get("devices"))
+                 if isinstance(d, dict) and isinstance(d.get("updatedAt"), (int, float))
+                 and started < d["updatedAt"] <= time.time() + 5}
+        fresh = {k: v for k, v in fresh.items() if k not in newer}
         state = compose_state(config, registry, previous, fresh, load_cache(), extra)
         write_json(STATE_PATH, state)
     return state
@@ -1050,9 +1311,13 @@ def scene_options(device, cloud, refresh=False):
     options = list(device.get("snapshots") or [])
     if not device.get("cloud") or not cloud or not device["supports"].get("scenes"):
         return options
-    cached = (load_cache().get("scenes") or {}).get(device["id"]) or {}
-    if not refresh and time.time() - cached.get("fetchedAt", 0) < SCENE_TTL:
-        return cached.get("options", []) + options
+    cached = as_dict(as_dict(load_cache().get("scenes")).get(device["id"]))
+    fetched_at = cached.get("fetchedAt")
+    if not refresh and isinstance(fetched_at, (int, float)) and time.time() - fetched_at < SCENE_TTL:
+        valid = [o for o in as_list(cached.get("options")) if isinstance(o, dict)
+                 and o.get("instance") in SCENE_INSTANCES and scene_value(o.get("value")) is not None
+                 and clean_text(o.get("name"))]
+        return valid + options
     fetched = cloud.scenes(device)
     update_file(CACHE_PATH, lambda c: c.setdefault("scenes", {}).update(
         {device["id"]: {"fetchedAt": time.time(), "options": fetched}}))
@@ -1155,10 +1420,25 @@ def apply(target, action, value, only_on=False):
     if not plan:
         raise GoveeError(f"no scene called {value!r} on those lights")
 
-    before = {d["id"]: {f: d.get(f) for f in FIELDS} for d, _ in plan}
-    patch_devices({d["id"]: optimistic(action, v, d) for d, v in plan})
+    before = {d["id"]: {f: d.get(f) for f in FIELDS + ("updatedAt", "via")} for d, _ in plan}
+    patch_devices({d["id"]: dict(optimistic(action, v, d), updatedAt=time.time()) for d, v in plan})
+    done = {}
+    try:
+        return send_plan(plan, action, cloud, before, done)
+    except GoveeError as error:
+        if not isinstance(error, TimedOut):
+            raise  # send_plan has already rolled back exactly the lights that failed
+        patch_devices({k: v for k, v in before.items() if k not in done}, error=str(error))
+        raise
+    except BaseException:
+        # Anything unexpected, a stop or a time-out included: the panel must
+        # not keep showing a change that was never confirmed.
+        patch_devices({k: v for k, v in before.items() if k not in done}, error="the command did not finish")
+        raise
 
-    failures, done = {}, {}
+
+def send_plan(plan, action, cloud, before, done):
+    failures = {}
     # Setting a level on a light that is off should light it.
     wake = action != "power"
 
@@ -1167,13 +1447,18 @@ def apply(target, action, value, only_on=False):
     rest = [(d, v) for d, v in plan if d["id"] not in lan_ids]
     if lan_plan:
         try:
+            sent = []
             with Lan() as lan:
                 for device, device_value in lan_plan:
-                    if wake and not device.get("power"):
-                        lan.command(device["ip"], *lan_message("power", True))
-                    lan.command(device["ip"], *lan_message(action, device_value))
+                    try:
+                        if wake and not device.get("power"):
+                            lan.command(device["ip"], *lan_message("power", True))
+                        lan.command(device["ip"], *lan_message(action, device_value))
+                        sent.append(device["ip"])
+                    except GoveeError:
+                        pass  # that light alone goes to the cloud
                 time.sleep(0.15)
-                answers = lan.status([d["ip"] for d, _ in lan_plan], timeout=0.8)
+                answers = lan.status(sent, timeout=0.8) if sent else {}
             for device, device_value in lan_plan:
                 if device["ip"] in answers:
                     # The answer proves the light heard us, but it may predate
@@ -1210,8 +1495,8 @@ def apply(target, action, value, only_on=False):
     names = {d["id"]: d["name"] for d, _ in plan}
     message = ""
     if failures:
-        message = "; ".join(sorted({f"{names[k]}: {v}" if len(plan) > 1 else v
-                                    for k, v in failures.items()}))
+        parts = sorted(f"{names[k]}: {v}" if len(plan) > 1 else v for k, v in failures.items())
+        message = "; ".join(parts[:3]) + (f"; and {len(parts) - 3} more" if len(parts) > 3 else "")
     patch_devices(changes, error=message or None, clear_error=not failures)
     if failures:
         raise GoveeError(message)
@@ -1222,14 +1507,15 @@ def apply(target, action, value, only_on=False):
 
 
 def cmd_setup(args):
-    config = load_config()
+    refuse_in_demo("set up your own lights")
     print("Govee lights setup\n")
     print("Lights with LAN Control turned on (Govee Home app → device → settings)")
     print("work locally without a key. For every other light, and for names and")
     print("scenes, the plugin needs a Govee API key: Govee Home app → Profile →")
     print("settings (gear) → Apply for API Key. It arrives by email.\n")
     key = getpass.getpass("API key (leave empty for LAN only): ").strip()
-    result = save_setup(config, key)
+    signal.alarm(RUN_LIMITS["setup-save"])  # the clock starts once the key is in
+    result = save_setup(key)
     if result["keyStore"] == "none":
         print(f"\nLAN only. Found {result['devices']} light(s) on the network.")
     else:
@@ -1240,43 +1526,55 @@ def cmd_setup(args):
         print(f"  {result['lanHint']}")
 
 
-def save_setup(config, key):
+def save_setup(key):
+    raw = None
     if key:
         if not valid_key(key):
             raise GoveeError("that does not look like a Govee API key")
-        raw = Cloud(key).devices()
-        update_file(CACHE_PATH, lambda c: c.update(devices={"fetchedAt": time.time(), "list": raw}))
-        store = store_key(config, key)
-        config.pop("lanOnly", None)
-    else:
-        if has_cloud(config):
+        raw = Cloud(key).devices()  # proves the key works, before anything is stored
+    with editing_config() as config:
+        if key:
+            store = store_key(config, key)
+            config.pop("lanOnly", None)
+        elif has_cloud(config):
             store = "keyring" if config.get("keyStore") == "keyring" else "file"
         else:
             store = "none"
             config["lanOnly"] = True
-    save_config(config)
-    state = poll(max_age=0, refresh_devices=bool(key))
+    if raw is not None:
+        update_file(CACHE_PATH, lambda c: c.update(devices={"fetchedAt": time.time(), "list": raw}))
+    state = poll(max_age=0)
     return {"devices": len(state["devices"]), "keyStore": store, "lanHint": state.get("lanHint", "")}
 
 
+def refuse_in_demo(what):
+    """Demo mode has its own config, but the keyring is shared: never let it
+    store or remove the real key."""
+    if DEMO:
+        raise GoveeError(f"demo mode is on: turn it off (eld-govee demo off) to {what}")
+
+
 def cmd_setup_save(args):
-    key = "" if args.lan_only else sys.stdin.readline().strip()
+    refuse_in_demo("set up your own lights")
+    key = "" if args.lan_only else sys.stdin.readline(1024).strip()
     if not key and not args.lan_only and not has_cloud(load_config()):
         raise GoveeError("paste the API key, or choose LAN only")
-    print(json.dumps(save_setup(load_config(), key)))
+    print(json.dumps(save_setup(key)))
 
 
 def cmd_forget_key(args):
-    config = load_config()
-    if config.get("keyStore") == "keyring":
+    refuse_in_demo("remove your API key")
+    with editing_config() as config:
         try:
             keyring_clear()
-        except KeyringUnavailable:
-            pass
-    config.pop("keyStore", None)
-    config.pop("apiKey", None)
-    config.pop("lanOnly", None)
-    save_config(config)
+        except KeyringUnavailable as error:
+            # Only an error when the key lives there; a key in the config file
+            # is removed whatever the keyring says.
+            if config.get("keyStore") == "keyring":
+                raise GoveeError(f"could not remove the key from the keyring: {error}. Nothing was changed.")
+        config.pop("keyStore", None)
+        config.pop("apiKey", None)
+        config.pop("lanOnly", None)
     update_file(CACHE_PATH, lambda c: (c.pop("devices", None), c.pop("scenes", None)))
     poll()
     print("API key removed. Revoke it with Govee too if it may have leaked.")
@@ -1389,37 +1687,36 @@ def cmd_scenes(args):
 
 
 def cmd_group(args):
-    config = load_config()
     if args.action == "list":
-        for name, members in sorted(config["groups"].items()):
+        for name, members in sorted(load_config()["groups"].items()):
             print(f"{name}: {len(members)} device(s)")
         return
     name = clean_text(args.name, "", 40)
     if not name or name.lower() == "all":
         raise GoveeError("give the group a name (not 'all')")
-    existing = next((k for k in config["groups"] if k.lower() == name.lower()), None)
-    if existing in config["followTheme"]:
-        config["followTheme"].remove(existing)
-        if args.action != "remove":
-            config["followTheme"].append(name)
-    if args.action == "remove":
-        if existing is None:
+    state = current_state()
+    with editing_config() as config:
+        existing = next((k for k in config["groups"] if k.lower() == name.lower()), None)
+        if args.action == "remove" and existing is None:
             raise GoveeError(f"no group called {name!r}")
-        del config["groups"][existing]
-        install_theme_hook(bool(config["followTheme"]))
-    else:
-        state = current_state()
         members = []
-        for wanted in args.devices:
-            for device in resolve(state, config, wanted):
-                if device["id"] not in members:
-                    members.append(device["id"])
-        if not members:
-            raise GoveeError("a group needs at least one device")
+        if args.action != "remove":
+            for wanted in args.devices:
+                for device in resolve(state, config, wanted):
+                    if device["id"] not in members:
+                        members.append(device["id"])
+            if not members:
+                raise GoveeError("a group needs at least one device")
+        if existing in config["followTheme"]:
+            config["followTheme"].remove(existing)
+            if args.action != "remove":
+                config["followTheme"].append(name)
         if existing is not None:
             del config["groups"][existing]
-        config["groups"][name] = members
-    save_config(config)
+        if args.action != "remove":
+            config["groups"][name] = members
+        following = bool(config["followTheme"])
+    install_theme_hook(following)
     poll(max_age=10**9, scan=False)
     print(f"group {name}: {'removed' if args.action == 'remove' else 'saved'}")
 
@@ -1444,12 +1741,16 @@ def install_theme_hook(enabled):
         with contextlib.suppress(FileNotFoundError):
             os.remove(THEME_HOOK)
         return
+    # The installed plugin's copy when there is one, so the hook keeps working
+    # however this run was started; no PATH lookup, which could find another.
+    installed = os.path.join(HOME, ".config", "omarchy", "plugins", "com.eldtechnologies.govee", "bin", "eld-govee")
+    exe = installed if os.access(installed, os.X_OK) else os.path.abspath(__file__)
     script = (
         "#!/bin/bash\n"
         "# Installed by eld-govee (Govee Lights for Omarchy): lights that follow the\n"
         "# theme take its colour. Remove with: eld-govee theme unfollow all\n"
-        f"exe={shlex.quote(os.path.abspath(__file__))}\n"
-        "[[ -x $exe ]] || exe=$(command -v eld-govee) || exit 0\n"
+        f"exe={shlex.quote(exe)}\n"
+        "[[ -x $exe ]] || exit 0  # the plugin was removed\n"
         "# In the background, so the LAN round trip never holds up the theme change.\n"
         '"$exe" theme apply >/dev/null 2>&1 &\n'
     )
@@ -1471,12 +1772,17 @@ def cmd_theme(args):
     config = load_config()
     if args.action == "apply":
         # From the theme-set hook: recolour the followers that are on. Lights
-        # that are off stay off; a theme change should not light a room.
-        rgb = theme_color()
-        if rgb is None or not config["followTheme"] or not is_configured(config):
+        # that are off stay off; a theme change should not light a room. One
+        # run at a time, and the colour is read last, so the newest theme wins.
+        if not config["followTheme"] or not is_configured(config):
             return
-        state = poll(max_age=60)
-        names = apply(theme_followers(config, state), "color", rgb, only_on=True)
+        install_theme_hook(True)  # refresh a hook written by an older version
+        with locked(THEME_LOCK):
+            state = poll(max_age=60)
+            rgb = theme_color()
+            if rgb is None:
+                return
+            names = apply(theme_followers(load_config(), state), "color", rgb, only_on=True)
         print(f"{', '.join(names)}: {hex_color(rgb)}" if names else "no light that follows the theme is on")
         return
     if args.action == "status":
@@ -1486,21 +1792,22 @@ def cmd_theme(args):
         names = [d["name"] for d in theme_followers(config, state)]
         print("followed by: " + (", ".join(names) if names else "nothing"))
         return
-    if args.action == "unfollow" and args.target.strip().lower() == "all":
-        config["followTheme"] = []
-    else:
-        key = follow_key(config, args.target)
-        if args.action == "follow" and key not in config["followTheme"]:
-            config["followTheme"].append(key)
-        elif args.action == "unfollow" and key in config["followTheme"]:
-            config["followTheme"].remove(key)
-    save_config(config)
-    install_theme_hook(bool(config["followTheme"]))
+    with editing_config() as config:
+        if args.action == "unfollow" and args.target.strip().lower() == "all":
+            config["followTheme"] = []
+        else:
+            key = follow_key(config, args.target)
+            if args.action == "follow" and key not in config["followTheme"]:
+                config["followTheme"].append(key)
+            elif args.action == "unfollow" and key in config["followTheme"]:
+                config["followTheme"].remove(key)
+        following = bool(config["followTheme"])
+    install_theme_hook(following)
     state = poll(max_age=10**9, scan=False)
     if args.action == "follow":
         rgb = theme_color()
         if rgb is not None:
-            apply(resolve(state, config, args.target), "color", rgb, only_on=True)
+            apply(resolve(state, load_config(), args.target), "color", rgb, only_on=True)
         print(f"{args.target} follows the theme")
     else:
         print(f"{args.target} no longer follows the theme")
@@ -1520,8 +1827,9 @@ def cmd_demo(args):
         shutil.rmtree(DEMO_DIR, ignore_errors=True)
     # The paths are fixed when the helper starts, so a fresh run rebuilds
     # state.json from the config now in force.
-    subprocess.run([sys.executable, os.path.abspath(__file__), "poll", "--devices", "--max-age", "0"],
-                   check=False, timeout=60)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        subprocess.run([sys.executable, os.path.abspath(__file__), "poll", "--devices", "--max-age", "0"],
+                       check=False, timeout=60)
     update_file(STATE_PATH, lambda state: state.update(error=None))
     if args.action == "on":
         print("Demo mode on: made-up lights in the panel. Your own setup is untouched.")
@@ -1540,27 +1848,55 @@ def single_device(target):
 
 def cmd_rename(args):
     device = single_device(args.device)
-    config = load_config()
     name = clean_text(args.name, "", 40)
-    if name:
-        config["aliases"][device["id"]] = name
-    else:
-        config["aliases"].pop(device["id"], None)
-    save_config(config)
+    with editing_config() as config:
+        if name:
+            config["aliases"][device["id"]] = name
+        else:
+            config["aliases"].pop(device["id"], None)
     poll(max_age=10**9, scan=False)
     print(f"{device['name']} → {name or 'its Govee name'}")
 
 
 def cmd_hide(args, hide=True):
     device = single_device(args.device)
-    config = load_config()
-    hidden = [d for d in config["hidden"] if d != device["id"]]
-    if hide:
-        hidden.append(device["id"])
-    config["hidden"] = hidden
-    save_config(config)
+    with editing_config() as config:
+        config["hidden"] = [d for d in config["hidden"] if d != device["id"]] + ([device["id"]] if hide else [])
     poll(max_age=10**9, scan=False)
     print(f"{device['name']}: {'hidden' if hide else 'shown'}")
+
+
+def cmd_forget(args):
+    """Drop LAN-only lights: one that is gone, or was never real, or with
+    --offline every LAN-only light that is not answering. A light still on
+    the network shows up again at the next scan."""
+    if args.offline:
+        devices = [d for d in current_state().get("devices") or []
+                   if not d.get("cloud") and d.get("online") is False]
+    elif args.device:
+        devices = [single_device(args.device)]
+        if devices[0].get("cloud"):
+            raise GoveeError(f"{devices[0]['name']} is on your Govee account: hide it instead")
+    else:
+        raise GoveeError("name a light, or use --offline")
+    gone = {d["id"] for d in devices}
+
+    def change(cache):
+        for key in ("lanKnown", "lan"):
+            if isinstance(cache.get(key), dict):
+                for device_id in gone:
+                    cache[key].pop(device_id, None)
+
+    update_file(CACHE_PATH, change)
+    with editing_config() as config:
+        config["aliases"] = {k: v for k, v in config["aliases"].items() if k not in gone}
+        config["hidden"] = [d for d in config["hidden"] if d not in gone]
+        config["groups"] = {name: [m for m in members if m not in gone] for name, members in config["groups"].items()}
+        config["followTheme"] = [k for k in config["followTheme"] if k not in gone]
+        following = bool(config["followTheme"])
+    install_theme_hook(following)
+    poll(max_age=10**9, scan=False)
+    print(f"forgotten: {', '.join(d['name'] for d in devices) or 'nothing'}")
 
 
 def cmd_dismiss(args):
@@ -1611,13 +1947,17 @@ def cmd_doctor(args):
 def notify(message):
     tool = shutil.which("notify-send")
     if tool:
-        # Notification daemons may render markup; light names are not markup.
-        subprocess.run([tool, "-a", "Govee", "Govee", html.escape(message, quote=False)],
-                       timeout=5, check=False)
+        # Light names are neither markup nor options.
+        body = html.escape(message[:300], quote=False)
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run([tool, "-a", "Govee", "--", "Govee", body], timeout=5, check=False)
 
 
 def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    # A stop from the panel's watchdog or the session unwinds like an error,
+    # so a half-done command is rolled back.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     parser = argparse.ArgumentParser(prog="eld-govee", description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=f"%(prog)s {plugin_version()}")
     parser.add_argument("--notify", action="store_true", help="show errors as a desktop notification")
@@ -1682,6 +2022,10 @@ def main():
     p = sub.add_parser("hide", help="hide a light from the panel and from 'all'")
     p.add_argument("device")
     p.set_defaults(func=cmd_hide)
+    p = sub.add_parser("forget", help="drop a LAN-only light that is gone")
+    p.add_argument("device", nargs="?")
+    p.add_argument("--offline", action="store_true", help="every LAN-only light that is not answering")
+    p.set_defaults(func=cmd_forget)
     p = sub.add_parser("unhide", help="show a hidden light again")
     p.add_argument("device")
     p.set_defaults(func=lambda a: cmd_hide(a, hide=False))
@@ -1701,8 +2045,19 @@ def main():
     sub.add_parser("doctor", help="check the setup").set_defaults(func=cmd_doctor)
 
     args = parser.parse_args()
+    limit = RUN_LIMITS.get(args.command, RUN_LIMIT)
+    if limit:
+        signal.signal(signal.SIGALRM, _timed_out)
+        signal.alarm(limit)
     try:
         args.func(args)
+    except TimedOut as error:
+        print(f"eld-govee: {error}", file=sys.stderr)
+        with contextlib.suppress(Exception):
+            flush_usage()
+        sys.stderr.flush()
+        # Worker threads may still be stuck in a socket; do not wait for them.
+        os._exit(1)
     except GoveeError as error:
         print(f"eld-govee: {error}", file=sys.stderr)
         if args.notify:
@@ -1710,11 +2065,16 @@ def main():
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
+    except Exception as error:  # a bug or bad data: say so in one line
+        message = f"unexpected error ({type(error).__name__}): {clean_text(error, '', 200)}"
+        print(f"eld-govee: {message}", file=sys.stderr)
+        if args.notify:
+            notify(message)
+        sys.exit(1)
     finally:
-        try:
+        signal.alarm(0)
+        with contextlib.suppress(Exception):
             flush_usage()
-        except OSError:
-            pass
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import stat
 import tempfile
 import unittest
 
-from helpers import API_KEY, CLOUD_ID, KEYRING_FILE, LAN_ID, PLUG_ID, FakeCloud, FakeLanLight, run_cli
+from helpers import API_KEY, CLOUD_ID, KEYRING_FILE, LAN_ID, NOTIFY_LOG, PLUG_ID, FakeCloud, FakeLanLight, run_cli
 
 
 class Sandbox(unittest.TestCase):
@@ -300,6 +300,77 @@ class Demo(Sandbox):
         self.assertFalse(state["demo"])
         self.assertEqual(state["groups"], [])
         self.assertEqual({d["id"] for d in state["devices"]}, {LAN_ID, CLOUD_ID, PLUG_ID})
+
+
+class Hostile(Sandbox):
+    """What a noisy or hostile host on the network, or a broken keyring, can do."""
+
+    def packet(self, msg):
+        return json.dumps({"msg": msg}).encode()
+
+    def test_junk_packets_are_ignored(self):
+        self.light.extra = [b"not json", b"[1]", self.packet({"cmd": "scan", "data": [1]}),
+                            self.packet({"cmd": "devStatus", "data": {"color": {"r": 1e400}}}),
+                            b'{"msg": {"cmd": "devStatus", "data": {"onOff": Infinity}}}']
+        self.cli("setup-save", "--lan-only")
+        self.cli("on", "H6008")
+        self.assertIs(self.device(LAN_ID)["power"], True)
+
+    def test_a_flood_of_made_up_lights_is_not_remembered(self):
+        fakes = [self.packet({"cmd": "scan", "data": {"device": "AA:BB:CC:DD:EE:%02X:00:11" % i, "sku": "H6008"}})
+                 for i in range(200)]
+        self.light.extra = fakes
+        self.cli("setup-save", "--lan-only")
+        self.assertEqual([d["id"] for d in self.state()["devices"]], [LAN_ID])
+        with open(os.path.join(self.home, "state", "eld-govee", "cache.json")) as handle:
+            self.assertEqual(list(json.load(handle)["lanKnown"]), [LAN_ID])
+
+    def test_forget_drops_a_lan_light(self):
+        self.cli("setup-save", "--lan-only")
+        self.cli("rename", LAN_ID, "Lamp")
+        self.cli("forget", "Lamp")
+        self.assertEqual(self.state()["devices"], [])
+
+    def test_cloud_lights_cannot_be_forgotten(self):
+        self.setup_key()
+        self.assertIn("hide it instead", self.cli("forget", "Shelf Strip", ok=False).stderr)
+
+    def test_a_locked_keyring_is_an_error_not_a_plaintext_file(self):
+        self.env["FAKE_SECRET_TOOL_FAIL"] = "Cannot unlock collection: dismissed"
+        result = self.cli("setup-save", stdin=API_KEY + "\n", ok=False)
+        self.assertIn("keyring did not store", result.stderr)
+        config = os.path.join(self.home, "config", "eld-govee", "config.json")
+        self.assertFalse(os.path.exists(config) and API_KEY in open(config).read())
+
+    def test_no_keyring_at_all_falls_back_to_the_file(self):
+        self.env["FAKE_SECRET_TOOL_FAIL"] = "The name org.freedesktop.secrets was not provided by any .service files"
+        self.assertEqual(self.setup_key()["keyStore"], "file")
+
+    def test_forget_key_says_so_when_the_keyring_will_not_let_go(self):
+        self.setup_key()
+        self.env["FAKE_SECRET_TOOL_FAIL"] = "Cannot unlock collection: dismissed"
+        self.assertIn("could not remove", self.cli("forget-key", ok=False).stderr)
+        self.assertTrue(os.path.exists(KEYRING_FILE))
+        self.assertTrue(self.state()["cloud"])
+
+    def test_demo_mode_never_touches_the_real_key(self):
+        self.setup_key()
+        self.cli("demo", "on")
+        self.assertIn("demo mode is on", self.cli("setup-save", stdin="other-key-5678\n", ok=False).stderr)
+        self.assertIn("demo mode is on", self.cli("forget-key", ok=False).stderr)
+        with open(KEYRING_FILE) as handle:
+            self.assertEqual(handle.read().strip(), API_KEY)
+
+    def test_notifications_treat_names_as_text(self):
+        self.setup_key()
+        self.cli("rename", "Shelf Strip", "--wait <b>x</b>")
+        self.cloud.close()
+        self.cli("--notify", "on", "--", "--wait <b>x</b>", ok=False)
+        with open(NOTIFY_LOG) as handle:
+            args = handle.read().splitlines()
+        self.assertEqual(args[:4], ["-a", "Govee", "--", "Govee"])
+        self.assertNotIn("<b>", args[4])
+        self.cloud = FakeCloud()
 
 
 if __name__ == "__main__":

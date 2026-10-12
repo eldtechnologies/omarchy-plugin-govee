@@ -24,7 +24,9 @@ Panel {
   property var hostWidget: null
 
   readonly property string home: Quickshell.env("HOME")
-  readonly property string stateHome: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
+  // A relative XDG_STATE_HOME is invalid by the spec; the helper ignores it too.
+  readonly property string stateHome: String(Quickshell.env("XDG_STATE_HOME") || "").charAt(0) === "/"
+                                      ? Quickshell.env("XDG_STATE_HOME") : home + "/.local/state"
   readonly property string statePath: stateHome + "/eld-govee/state.json"
   readonly property string pluginDir: decodeURIComponent(
     String(Qt.resolvedUrl(".")).replace("file://", ""))
@@ -169,11 +171,19 @@ Panel {
     pump()
   }
 
+  // "--" before names and targets: a light or group called "-h" is a name,
+  // not an option. theme and group take a subcommand first.
+  function helperArgs(args) {
+    var split = (args[0] === "theme" || args[0] === "group") ? 2 : 1
+    return args.length > split ? args.slice(0, split).concat(["--"], args.slice(split)) : args
+  }
+
   function pump() {
     if (cmdProcess.running || root.queue.length === 0) return
-    cmdProcess.command = [root.cli].concat(root.queue[0])
+    cmdProcess.command = [root.cli].concat(helperArgs(root.queue[0]))
     root.queue = root.queue.slice(1)
     cmdProcess.running = true
+    cmdWatchdog.restart()  // each queued command gets its own time
   }
 
   function helperError(text, fallback) {
@@ -200,7 +210,8 @@ Panel {
         root.followOverrides = ({})
         stateFile.reload()
       }
-      root.pump()
+      // Start the next one once this exit has fully settled.
+      Qt.callLater(root.pump)
     }
   }
 
@@ -308,6 +319,20 @@ Panel {
     onExited: stateFile.reload()
   }
 
+  // A helper that hangs (a dead network, a server that never finishes) must
+  // not stall the panel: stop any run that takes far longer than it should.
+  property string confirmForget: ""
+  Timer {
+    id: forgetTimer
+    interval: 4000
+    onTriggered: root.confirmForget = ""
+  }
+
+  Watchdog { id: cmdWatchdog; process: cmdProcess; seconds: 60 }
+  Watchdog { process: pollProcess; seconds: 60 }
+  Watchdog { process: sceneProcess; seconds: 60 }
+  Watchdog { process: setupSave; seconds: 90 }
+
   Component.onCompleted: reloadState(root.backgroundCloudAge)
 
   Timer {
@@ -326,7 +351,7 @@ Panel {
     if (root.sceneLists[target] !== undefined || sceneProcess.running) return
     root.sceneLoading = target
     sceneProcess.target = target
-    sceneProcess.command = [root.cli, "scenes", target, "--json"]
+    sceneProcess.command = [root.cli, "scenes", "--json", "--", target]
     sceneProcess.running = true
   }
 
@@ -449,6 +474,11 @@ Panel {
       write(secret + "\n")
       secret = ""
     }
+    // Also when it never started, which may not report an exit.
+    onRunningChanged: if (!running) {
+      secret = ""
+      Qt.callLater(function() { if (!setupSave.running) root.setupBusy = "" })
+    }
     onExited: function(exitCode) {
       root.setupBusy = ""
       if (exitCode !== 0) {
@@ -549,6 +579,14 @@ Panel {
     fontSize: Style.font.bodySmall
     opacity: enabled ? 1 : 0.4
     onClicked: if (enabled) triggered()
+  }
+
+  component Watchdog: Timer {
+    property var process: null
+    property int seconds: 60
+    interval: seconds * 1000
+    running: process !== null && process.running
+    onTriggered: if (process) process.running = false
   }
 
   component Caption: Text {
@@ -1030,6 +1068,13 @@ Panel {
               color: root.urgent
             }
 
+            Caption {
+              visible: root.configured && !root.settingUp && (root.state.lanError || "") !== ""
+              width: parent.width
+              text: "Local network: " + (root.state.lanError || "")
+              color: root.urgent
+            }
+
             // The most common reason nothing shows up on the LAN.
             Rectangle {
               visible: root.configured && !root.settingUp && (root.state.lanHint || "") !== ""
@@ -1060,18 +1105,16 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
-                Row {
-                  spacing: Style.space(6)
-                  ActionButton {
-                    label: "Copy command"
-                    outlined: true
-                    onTriggered: Quickshell.execDetached(["wl-copy", root.state.lanHint || ""])
-                  }
-                  Caption {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "and turn on LAN Control for each light in the Govee app"
-                    font.pixelSize: Style.font.caption
-                  }
+                ActionButton {
+                  label: "Copy command"
+                  outlined: true
+                  onTriggered: Quickshell.execDetached(["wl-copy", "--", root.state.lanHint || ""])
+                }
+                Caption {
+                  width: parent.width
+                  text: "The rule stays until you remove it, and lets that whole subnet reach this "
+                      + "port. Also turn on LAN Control for each light in the Govee app."
+                  font.pixelSize: Style.font.caption
                 }
               }
             }
@@ -1370,6 +1413,22 @@ Panel {
                     label: deviceRow.modelData.hidden ? "Unhide" : "Hide"
                     outlined: true
                     onTriggered: root.run([deviceRow.modelData.hidden ? "unhide" : "hide", deviceRow.target])
+                  }
+                  // A LAN-only light that is gone, or was never real. A second
+                  // click confirms: a light that is only unplugged comes back.
+                  ActionButton {
+                    visible: deviceRow.modelData.cloud !== true && deviceRow.modelData.online === false
+                    label: root.confirmForget === deviceRow.target ? "Click again to forget" : "Forget"
+                    outlined: true
+                    onTriggered: {
+                      if (root.confirmForget === deviceRow.target) {
+                        root.confirmForget = ""
+                        root.run(["forget", deviceRow.target])
+                      } else {
+                        root.confirmForget = deviceRow.target
+                        forgetTimer.restart()
+                      }
+                    }
                   }
                   Caption {
                     anchors.verticalCenter: parent.verticalCenter

@@ -2,15 +2,17 @@
 
 Your Govee lights in the Omarchy bar: switch them on and off, set brightness,
 colour and white temperature, apply Govee's scenes, control rooms of lights
-as groups, and let them take your Omarchy theme's colour. Lights with LAN Control are driven over your local network,
-instantly and without the cloud. Everything else goes through the official
-Govee cloud API. Setup happens in the panel, and the API key stays out of the
-shell.
+as groups, and let them take your Omarchy theme's colour. Lights with LAN
+Control are driven over your local network, instantly and without the cloud.
+Everything else goes through the official Govee cloud API. Setup happens in
+the panel, and the API key goes to your keyring (or, on a system without
+one, a file only you can read), never into the shell's settings or onto a
+command line.
 
 In the bar it is a single bulb. It lights up, in your theme's accent colour,
 while any light is on.
 
-Version 0.2.1 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
+Version 0.3.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
 
 > **Unofficial.** This is an independent community plugin. It is not made,
 > endorsed, or supported by Govee or by the Omarchy project.
@@ -88,13 +90,25 @@ down, and costs nothing from the cloud quota. Two things are needed:
    sudo ufw allow from 192.168.1.0/24 to any port 4002 proto udp comment 'Govee LAN'
    ```
 
-   The rule only admits your own subnet, on that one port.
+   The rule only admits your own subnet, on that one port. It stays until
+   you remove it (`sudo ufw status numbered`, then `sudo ufw delete <n>`).
+   It matches addresses, not networks: on a laptop, another network that
+   uses the same range is let in too. To tie it to one interface, add
+   `in on <interface>` after `allow` (see `ip route` for the name).
 
 `eld-govee doctor` checks both.
 
 Lights on the LAN are matched to their cloud entries automatically, so they
 keep their names and scenes. If a light stops answering on the LAN, commands
 fall back to the cloud.
+
+Only replies from a network your computer is directly on count, one light
+per address. The plugin remembers LAN-only lights for a month after it last
+heard from them, and at most 128. To drop one that is gone, open it and
+press **Forget** twice, or run `eld-govee forget <name>`
+(`eld-govee forget --offline` drops every LAN-only light that is not
+answering). The plugin needs UDP port 4002 to itself; if another program
+holds it, the panel says so under "Local network".
 
 ## Using it
 
@@ -177,6 +191,7 @@ eld-govee scene "Shelf" Aurora
 eld-govee scenes "Shelf"               # what scenes that light has
 eld-govee rename "H6008 0011" "Desk Lamp"
 eld-govee hide "Fan Plug"              # leaves the panel and 'all'
+eld-govee forget "H6072 6452"          # a LAN-only light that is gone
 eld-govee theme follow Office          # see Theme colours
 ```
 
@@ -260,18 +275,25 @@ well under that:
 
 ## Removing it
 
+Run the uninstaller. It removes the plugin, the `eld-govee` command and the
+theme hook, and asks whether to delete your API key, groups and names too:
+
 ```bash
-omarchy plugin remove com.eldtechnologies.govee
-# or, from a checkout:
-./uninstall.sh            # asks whether to delete the key and groups
-./uninstall.sh --purge    # deletes them
+~/.config/omarchy/plugins/com.eldtechnologies.govee/uninstall.sh            # installed with omarchy plugin add
+./uninstall.sh                                                              # from a checkout
+~/.config/omarchy/plugins/com.eldtechnologies.govee/uninstall.sh --purge    # delete them without asking
 ```
 
-Removing the key locally does not revoke it with Govee. `uninstall.sh` also
-removes the theme hook; after `omarchy plugin remove`, run
-`eld-govee theme unfollow all` first, or delete
-`~/.config/omarchy/hooks/theme-set.d/eld-govee` (left behind, it does
-nothing).
+`omarchy plugin remove com.eldtechnologies.govee` on its own removes only
+the plugin folder. To clean up after it by hand:
+
+```bash
+rm -rf ~/.config/eld-govee ~/.local/state/eld-govee
+rm -f ~/.config/omarchy/hooks/theme-set.d/eld-govee
+secret-tool clear service eld-govee
+```
+
+Deleting the key from this computer does not revoke it with Govee.
 
 ## Developing
 

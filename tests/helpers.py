@@ -35,6 +35,8 @@ os.makedirs(FAKE_BIN)
 KEYRING_FILE = os.path.join(SANDBOX, "keyring")
 with open(os.path.join(FAKE_BIN, "secret-tool"), "w") as handle:
     handle.write(f"""#!/bin/sh
+# FAKE_SECRET_TOOL_FAIL makes every call fail with that message.
+if [ -n "$FAKE_SECRET_TOOL_FAIL" ]; then echo "$FAKE_SECRET_TOOL_FAIL" >&2; exit 1; fi
 case "$1" in
   store) cat > "{KEYRING_FILE}" ;;
   lookup) [ -f "{KEYRING_FILE}" ] && cat "{KEYRING_FILE}" || exit 1 ;;
@@ -42,6 +44,14 @@ case "$1" in
 esac
 """)
 os.chmod(os.path.join(FAKE_BIN, "secret-tool"), 0o755)
+
+# A notify-send that records its arguments, one per line.
+NOTIFY_LOG = os.path.join(SANDBOX, "notify.log")
+with open(os.path.join(FAKE_BIN, "notify-send"), "w") as handle:
+    handle.write(f"""#!/bin/sh
+for arg in "$@"; do printf '%s\\n' "$arg"; done > "{NOTIFY_LOG}"
+""")
+os.chmod(os.path.join(FAKE_BIN, "notify-send"), 0o755)
 os.environ["PATH"] = FAKE_BIN + os.pathsep + os.environ.get("PATH", "")
 
 API_KEY = "test-key-1234-abcd"
@@ -172,6 +182,7 @@ class FakeLanLight:
         self.scan_port, self.listen_port, self.control_port = free_port(), free_port(), free_port()
         self.commands = []
         self.answer_status = True
+        self.extra = []  # raw packets sent after each scan reply and status answer
         self.status = {"onOff": 0, "brightness": 10, "color": {"r": 0, "g": 0, "b": 0},
                        "colorTemInKelvin": 3000}
         self.sockets = []
@@ -200,9 +211,11 @@ class FakeLanLight:
             if cmd == "scan":
                 self.send(ip, {"cmd": "scan", "data": {"ip": "10.9.9.9", "device": self.device_id,
                                                          "sku": self.sku}})
+                self.send_extra(ip)
             elif cmd == "devStatus":
                 if self.answer_status:
                     self.send(ip, {"cmd": "devStatus", "data": self.status})
+                self.send_extra(ip)
             else:
                 self.commands.append((cmd, data))
                 if cmd == "turn":
@@ -212,6 +225,11 @@ class FakeLanLight:
                 elif cmd == "colorwc":
                     self.status["color"] = data["color"]
                     self.status["colorTemInKelvin"] = data["colorTemInKelvin"]
+
+    def send_extra(self, ip):
+        for raw in self.extra:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as out:
+                out.sendto(raw, (ip, self.listen_port))
 
     def send(self, ip, msg):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as out:
