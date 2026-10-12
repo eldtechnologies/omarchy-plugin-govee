@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import fcntl
 import getpass
+import html
 import ipaddress
 import json
 import os
@@ -1610,7 +1611,9 @@ def cmd_doctor(args):
 def notify(message):
     tool = shutil.which("notify-send")
     if tool:
-        subprocess.run([tool, "-a", "Govee", "Govee", message], timeout=5, check=False)
+        # Notification daemons may render markup; light names are not markup.
+        subprocess.run([tool, "-a", "Govee", "Govee", html.escape(message, quote=False)],
+                       timeout=5, check=False)
 
 
 def main():

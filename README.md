@@ -10,7 +10,7 @@ shell.
 In the bar it is a single bulb. It lights up, in your theme's accent colour,
 while any light is on.
 
-Version 0.2.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
+Version 0.2.1 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
 
 > **Unofficial.** This is an independent community plugin. It is not made,
 > endorsed, or supported by Govee or by the Omarchy project.
@@ -34,6 +34,8 @@ themselves are of the real plugin.*
 - `python3` (ships with Omarchy; the helper uses only the standard library)
 - `secret-tool` from `libsecret` and a keyring such as `gnome-keyring` (both
   ship with Omarchy) to keep the API key in the keyring; optional
+- Also used when present, all shipped with Omarchy: `ip` (iproute2) for the
+  firewall hint, `wl-copy` for its Copy button, `notify-send` for `--notify`
 - For the cloud: a Govee API key (free, see below). For LAN control:
   LAN Control turned on for each light, and the firewall rule below
 

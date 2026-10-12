@@ -3,6 +3,18 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-govee --version` reads it from there.
 
+## 0.2.1 — 2026-10-12
+
+### Fixed
+
+- Error notifications (`--notify`) escape markup, so a light's name is
+  always shown as written.
+
+### Added
+
+- `preview.png` for the Omarchy plugin marketplace. README screenshots have
+  clean rounded corners.
+
 ## 0.2.0 — 2026-10-12
 
 ### Added
