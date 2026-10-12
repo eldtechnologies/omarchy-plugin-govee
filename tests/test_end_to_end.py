@@ -18,6 +18,7 @@ class Sandbox(unittest.TestCase):
         self.cloud = FakeCloud()
         self.light = FakeLanLight()
         self.env = {
+            "HOME": self.home,
             "XDG_CONFIG_HOME": os.path.join(self.home, "config"),
             "XDG_STATE_HOME": os.path.join(self.home, "state"),
             "ELD_GOVEE_TEST_API_BASE": self.cloud.url,
@@ -208,6 +209,97 @@ class Control(Sandbox):
         self.cli("forget-key")
         self.assertFalse(os.path.exists(KEYRING_FILE))
         self.assertFalse(self.state()["configured"])
+
+
+class FollowTheme(Sandbox):
+    """Lights that take the Omarchy theme's colour."""
+
+    def setUp(self):
+        super().setUp()
+        self.setup_key()
+        self.hook = os.path.join(self.home, ".config", "omarchy", "hooks", "theme-set.d", "eld-govee")
+        self.set_theme("00ff80")
+
+    def set_theme(self, rgb):
+        theme = os.path.join(self.home, ".local", "state", "omarchy", "current", "theme")
+        os.makedirs(theme, exist_ok=True)
+        with open(os.path.join(theme, "keyboard.rgb"), "w") as handle:
+            handle.write(rgb + "\n")
+
+    def colours_sent(self):
+        return [data["color"] for cmd, data in self.light.commands if cmd == "colorwc"]
+
+    def test_following_installs_the_hook_and_recolours_a_lit_light(self):
+        self.cli("on", "Desk Lamp")
+        self.cli("theme", "follow", "Desk Lamp")
+        self.assertEqual(self.colours_sent(), [{"r": 0, "g": 255, "b": 128}])
+        self.assertTrue(os.access(self.hook, os.X_OK))
+        with open(self.hook) as handle:
+            self.assertIn("theme apply", handle.read())
+        self.assertTrue(self.device(LAN_ID)["followsTheme"])
+        self.assertEqual(self.state()["theme"]["color"], "#00ff80")
+
+    def test_a_theme_change_leaves_lights_that_are_off_alone(self):
+        self.cli("theme", "follow", "Desk Lamp")  # it is off
+        self.set_theme("ff0000")
+        self.cli("theme", "apply")
+        self.assertEqual(self.light.commands, [])
+        self.assertIs(self.device(LAN_ID)["power"], False)
+
+    def test_a_theme_change_recolours_a_group_on_lan_and_cloud(self):
+        self.cli("group", "set", "Office", "Desk Lamp", "Shelf Strip")
+        self.cli("on", "Office")
+        self.cli("theme", "follow", "office")
+        self.set_theme("ff0000")
+        self.cli("theme", "apply")
+        self.assertEqual(self.colours_sent()[-1], {"r": 255, "g": 0, "b": 0})
+        self.assertIn((CLOUD_ID, "colorRgb", 0xFF0000), self.cloud.controls)
+        self.assertTrue(self.state()["groups"][0]["followsTheme"])
+
+    def test_renaming_a_group_keeps_it_following_and_removing_it_stops(self):
+        self.cli("group", "set", "Office", "Desk Lamp")
+        self.cli("theme", "follow", "Office")
+        self.cli("group", "set", "office", "Desk Lamp")  # same group, new spelling
+        self.assertTrue(self.state()["groups"][0]["followsTheme"])
+        self.cli("group", "remove", "Office")
+        self.assertFalse(os.path.exists(self.hook))
+
+    def test_unfollow_all_removes_the_hook(self):
+        self.cli("theme", "follow", "all")
+        self.cli("theme", "unfollow", "all")
+        self.assertFalse(os.path.exists(self.hook))
+        self.assertIn("nothing", self.cli("theme").stdout)
+
+
+class Demo(Sandbox):
+    DESK = "D0:E1:00:00:00:00:00:01"
+    SHELF = "D0:E1:00:00:00:00:00:03"
+
+    def test_demo_lights_work_like_real_ones_and_leave_the_real_setup_alone(self):
+        self.setup_key()
+        self.cli("demo", "on")
+        state = self.state()
+        self.assertTrue(state["demo"])
+        self.assertEqual(len(state["devices"]), 5)
+        self.assertEqual([g["name"] for g in state["groups"]], ["Living room", "Office"])
+        self.assertEqual(self.device(self.DESK)["via"], "lan")
+
+        self.cli("color", "Desk Lamp", "#00ff80")
+        self.cli("scene", "Shelf Strip", "ocean")
+        self.cli("group", "set", "Desk", "Desk Lamp")
+        self.cli("theme", "follow", "Office")  # the hook belongs to the real lights
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config", "omarchy", "hooks")))
+        self.cli("poll", "--max-age", "0")
+        self.assertEqual(self.device(self.DESK)["color"], "#00ff80")
+        self.assertEqual(self.device(self.SHELF)["color"], "#1e6bff")
+        self.assertEqual(self.cloud.controls, [])
+        self.assertEqual(self.light.commands, [])
+
+        self.cli("demo", "off")
+        state = self.state()
+        self.assertFalse(state["demo"])
+        self.assertEqual(state["groups"], [])
+        self.assertEqual({d["id"] for d in state["devices"]}, {LAN_ID, CLOUD_ID, PLUG_ID})
 
 
 if __name__ == "__main__":

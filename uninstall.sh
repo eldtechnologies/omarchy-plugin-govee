@@ -11,6 +11,7 @@ state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/eld-govee"
 omarchy plugin disable "$plugin_id" 2>/dev/null || true
 if [[ -L $plugin_dir ]]; then rm "$plugin_dir"; else rm -rf "$plugin_dir"; fi
 rm -f "$HOME/.local/bin/eld-govee"
+rm -f "$HOME/.config/omarchy/hooks/theme-set.d/eld-govee"
 omarchy-shell shell rescanPlugins 2>/dev/null || true
 
 purge=${1:-}

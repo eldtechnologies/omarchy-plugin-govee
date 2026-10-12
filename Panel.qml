@@ -39,6 +39,9 @@ Panel {
   FileView {
     path: root.pluginDir + "manifest.json"
     printErrors: false
+    // An update rewrites the manifest under a running shell.
+    watchChanges: true
+    onFileChanged: reload()
     onLoaded: {
       try {
         var manifest = JSON.parse(text())
@@ -67,6 +70,10 @@ Panel {
   property var state: ({})
   // Optimistic values per device id, shown until the helper catches up.
   property var overrides: ({})
+  // Follow-theme switches by target, likewise.
+  property var followOverrides: ({})
+  readonly property bool demo: state && state.demo === true
+  readonly property string themeColor: state && state.theme ? (state.theme.color || "") : ""
 
   readonly property bool configured: state && state.configured === true
   readonly property bool hasCloud: state && state.cloud === true
@@ -123,7 +130,10 @@ Panel {
     if (!text || text.trim() === "") return
     try {
       root.state = JSON.parse(text)
-      if (!cmdProcess.running && root.queue.length === 0) root.overrides = ({})
+      if (!cmdProcess.running && root.queue.length === 0) {
+        root.overrides = ({})
+        root.followOverrides = ({})
+      }
     } catch (error) { }
   }
 
@@ -187,6 +197,7 @@ Panel {
       }
       if (root.queue.length === 0) {
         root.overrides = ({})
+        root.followOverrides = ({})
         stateFile.reload()
       }
       root.pump()
@@ -241,6 +252,19 @@ Panel {
   function setColor(target, hex) {
     override(target, { color: hex, mode: "color", power: true })
     run(["color", target, hex])
+  }
+
+  function follows(target, stored) {
+    return target in root.followOverrides ? root.followOverrides[target] : stored === true
+  }
+
+  // The helper installs or removes the Omarchy theme-set hook, and recolours
+  // the lights that are on.
+  function setFollow(target, follow) {
+    var next = Object.assign({}, root.followOverrides)
+    next[target] = follow
+    root.followOverrides = next
+    run(["theme", follow ? "follow" : "unfollow", target])
   }
 
   function setTemp(target, kelvin) {
@@ -602,6 +626,7 @@ Panel {
     property var supports: ({})
     property var tempRange: [2000, 9000]
     property int colorTemp: 0
+    property bool follows: false
     spacing: Style.space(8)
 
     Flow {
@@ -675,6 +700,66 @@ Panel {
       fontFamily: root.fontFamily
       options: root.sceneLists[look.target] || []
       onChanged: function(value) { if (value !== "") root.setScene(look.target, value) }
+    }
+
+    // The Omarchy theme's colour: the dot applies it once, the switch keeps
+    // it in step with every theme change.
+    Item {
+      visible: look.supports.color === true && root.themeColor !== ""
+      width: parent.width
+      height: Math.max(themeText.implicitHeight, followSwitch.implicitHeight)
+
+      Rectangle {
+        id: themeDot
+        width: Style.space(26)
+        height: width
+        radius: width / 2
+        color: root.themeColor
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        border.width: themeMouse.containsMouse ? Math.max(1, Style.space(2)) : 1
+        border.color: themeMouse.containsMouse ? root.foreground : Util.alpha(root.foreground, 0.25)
+        MouseArea {
+          id: themeMouse
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: root.setColor(look.target, root.themeColor)
+        }
+      }
+
+      Column {
+        id: themeText
+        anchors.left: themeDot.right
+        anchors.leftMargin: Style.space(10)
+        anchors.right: followSwitch.left
+        anchors.rightMargin: Style.space(8)
+        anchors.verticalCenter: parent.verticalCenter
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Follow theme"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+        Caption {
+          width: parent.width
+          text: "Changes colour with your Omarchy theme"
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      ToggleSwitch {
+        id: followSwitch
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        checked: root.follows(look.target, look.follows)
+        foreground: root.foreground
+        cursorRing: false
+        onToggled: root.setFollow(look.target, !root.follows(look.target, look.follows))
+      }
     }
   }
 
@@ -1197,6 +1282,7 @@ Panel {
                   width: parent.width
                   target: groupRow.target
                   supports: groupRow.modelData.supports
+                  follows: groupRow.modelData.followsTheme === true
                 }
                 ActionButton {
                   label: "Edit group"
@@ -1240,6 +1326,7 @@ Panel {
                   supports: deviceRow.modelData.supports
                   tempRange: deviceRow.modelData.tempRange || [2000, 9000]
                   colorTemp: deviceRow.modelData.mode === "temp" ? (deviceRow.modelData.colorTemp || 0) : 0
+                  follows: deviceRow.modelData.followsTheme === true
                 }
                 // LAN-only lights only know their model number; let them
                 // have a real name. Enter or Save stores it, Esc puts it back.
@@ -1311,7 +1398,13 @@ Panel {
                 onActivated: root.openEditor(null)
               }
               LinkText {
+                text: "Leave demo"
+                visible: root.demo
+                onActivated: root.run(["demo", "off"])
+              }
+              LinkText {
                 text: root.hasCloud ? "Change API key" : "Add API key"
+                visible: !root.demo
                 onActivated: {
                   root.changingKey = true
                   Qt.callLater(function() { keyField.forceActiveFocus() })
@@ -1327,7 +1420,8 @@ Panel {
               visible: root.configured && !root.settingUp
               width: parent.width
               font.pixelSize: Style.font.caption
-              text: (root.hasCloud && root.state.usage
+              text: (root.demo ? "Demo mode: made-up lights  ·  " : "")
+                  + (root.hasCloud && !root.demo && root.state.usage
                      ? root.state.usage.today + " of " + root.state.usage.limit + " cloud requests today  ·  " : "")
                   + "↑↓ select · Enter switch · ←→ dim · E colours · A all"
             }

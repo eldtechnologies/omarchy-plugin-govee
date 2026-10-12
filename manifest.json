@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "com.eldtechnologies.govee",
   "name": "Govee Lights",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "ELD Technologies",
   "license": "MIT",
   "description": "Control your Govee lights from the Omarchy bar: power, brightness, colour, white temperature, scenes and groups, over the local network first and the Govee cloud when needed.",

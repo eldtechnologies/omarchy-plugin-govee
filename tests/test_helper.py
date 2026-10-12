@@ -1,8 +1,30 @@
 """Unit tests for the parts of the helper that can break quietly."""
 
+import os
+import shutil
 import unittest
 
 from helpers import CLOUD_ID, LAN_ID, PLUG_ID, FakeCloud, helper as h
+
+
+class ThemeFiles:
+    """A fake Omarchy current theme for the length of a with block."""
+
+    def __init__(self, keyboard=None, accent=None):
+        self.files = {}
+        if keyboard is not None:
+            self.files["keyboard.rgb"] = keyboard + "\n"
+        if accent is not None:
+            self.files["colors.toml"] = f'mode = "dark"\n\naccent = "{accent}"\nbackground = "#000000"\n'
+
+    def __enter__(self):
+        os.makedirs(h.OMARCHY_THEME_DIR)
+        for name, text in self.files.items():
+            with open(os.path.join(h.OMARCHY_THEME_DIR, name), "w") as handle:
+                handle.write(text)
+
+    def __exit__(self, *exc):
+        shutil.rmtree(h.OMARCHY_THEME_DIR)
 
 
 class Parsing(unittest.TestCase):
@@ -17,6 +39,12 @@ class Parsing(unittest.TestCase):
         self.assertEqual(h.hex_color((255, 136, 0)), "#ff8800")
         with self.assertRaises(h.GoveeError):
             h.parse_color("blurple")
+
+    def test_theme_is_a_colour_name(self):
+        with ThemeFiles(keyboard="00ff80"):
+            self.assertEqual(h.parse_color("theme"), (0, 255, 128))
+        with self.assertRaises(h.GoveeError):
+            h.parse_color("theme")  # no theme files
 
     def test_names_lose_control_characters(self):
         self.assertEqual(h.clean_text("Desk\x1b[31m Lamp\n"), "Desk [31m Lamp")
@@ -136,6 +164,24 @@ class Scenes(unittest.TestCase):
         self.assertEqual(h.find_scene(self.options, "sunrise")["name"], "Sunrise")
         self.assertEqual(h.find_scene(self.options, "aur")["name"], "Aurora")
         self.assertIsNone(h.find_scene(self.options, "sun"))
+
+
+
+class ThemeColour(unittest.TestCase):
+    def test_keyboard_colour_wins_and_is_scaled_to_full_strength(self):
+        with ThemeFiles(keyboard="7f007f", accent="#7aa2f7"):
+            self.assertEqual(h.theme_color(), (255, 0, 255))
+
+    def test_accent_when_the_theme_has_no_keyboard_colour(self):
+        with ThemeFiles(keyboard="not a colour", accent="#7aa2f7"):
+            self.assertEqual(h.theme_color(), (126, 167, 255))
+
+    def test_grey_accents_make_white_light(self):
+        with ThemeFiles(accent="#6e6e6e"):
+            self.assertEqual(h.theme_color(), (255, 255, 255))
+
+    def test_no_theme(self):
+        self.assertIsNone(h.theme_color())
 
 
 if __name__ == "__main__":

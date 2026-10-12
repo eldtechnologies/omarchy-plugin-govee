@@ -16,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -38,6 +39,21 @@ STATE_PATH = os.path.join(STATE_DIR, "state.json")
 CACHE_PATH = os.path.join(STATE_DIR, "cache.json")
 STATE_LOCK = os.path.join(STATE_DIR, "state.lock")
 LAN_LOCK = os.path.join(STATE_DIR, "lan.lock")
+# Omarchy keeps the current theme, and runs theme-set hooks, from fixed places
+# under $HOME, whatever the XDG variables say.
+OMARCHY_THEME_DIR = os.path.join(HOME, ".local", "state", "omarchy", "current", "theme")
+THEME_HOOK = os.path.join(HOME, ".config", "omarchy", "hooks", "theme-set.d", "eld-govee")
+
+# Demo mode: made-up lights for screenshots, development and trying the
+# plugin without Govee hardware. Its config and cache live apart from the real
+# ones, which it never touches; only state.json, which the panel reads, is
+# shared, and the next real poll rebuilds it.
+DEMO_DIR = os.path.join(STATE_DIR, "demo")
+DEMO = os.path.isfile(os.path.join(DEMO_DIR, "config.json"))
+if DEMO:
+    CONFIG_DIR = DEMO_DIR
+    CONFIG_PATH = os.path.join(DEMO_DIR, "config.json")
+    CACHE_PATH = os.path.join(DEMO_DIR, "cache.json")
 
 
 def _loopback_only(value):
@@ -151,14 +167,47 @@ def norm_sku(value):
 
 def parse_color(text):
     value = str(text).strip().lower()
+    if value == "theme":
+        rgb = theme_color()
+        if rgb is None:
+            raise GoveeError("cannot read the Omarchy theme's colour")
+        return rgb
     value = COLOR_NAMES.get(value, value).lstrip("#")
     if not re.fullmatch(r"[0-9a-f]{6}", value):
-        raise GoveeError(f"not a colour: {text!r} (use #rrggbb or one of {', '.join(COLOR_NAMES)})")
+        raise GoveeError(f"not a colour: {text!r} (use #rrggbb, theme, or one of {', '.join(COLOR_NAMES)})")
     return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
 
 
 def hex_color(rgb):
     return "#%02x%02x%02x" % tuple(max(0, min(255, int(c))) for c in rgb)
+
+
+def theme_color():
+    """The current Omarchy theme's colour for lights, or None.
+
+    Omarchy writes keyboard.rgb for RGB keyboards: the theme's accent, unless
+    the theme picks a colour of its own. Lights use the same, falling back to
+    the accent. It is scaled to full strength, because brightness is set on
+    its own and a muted accent would otherwise make a dim, grey light.
+    """
+    value = ""
+    with contextlib.suppress(OSError):
+        with open(os.path.join(OMARCHY_THEME_DIR, "keyboard.rgb")) as handle:
+            value = handle.read(64).strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
+        try:
+            with open(os.path.join(OMARCHY_THEME_DIR, "colors.toml")) as handle:
+                match = re.search(r'^\s*accent\s*=\s*"#?([0-9a-fA-F]{6})"', handle.read(65536), re.M)
+        except OSError:
+            return None
+        if not match:
+            return None
+        value = match.group(1)
+    rgb = [int(value[i:i + 2], 16) for i in (0, 2, 4)]
+    peak = max(rgb)
+    if peak == 0:
+        return (255, 255, 255)
+    return tuple(round(c * 255 / peak) for c in rgb)
 
 
 # ---- API key storage -----------------------------------------------------
@@ -220,7 +269,7 @@ def load_config():
         raise GoveeError(f"cannot read {CONFIG_PATH}: {error}")
     if not isinstance(config, dict):
         config = {}
-    for name, empty in (("groups", {}), ("aliases", {}), ("hidden", [])):
+    for name, empty in (("groups", {}), ("aliases", {}), ("hidden", []), ("followTheme", [])):
         if not isinstance(config.get(name), type(empty)):
             config[name] = empty
     return config
@@ -537,6 +586,129 @@ class Lan:
                     break
         return answers
 
+# ---- demo mode -----------------------------------------------------------
+#
+# A pretend Govee account: two lights on the LAN, two cloud-only lights and a
+# plug. DemoCloud and DemoLan stand in for Cloud and Lan, so everything above
+# them, from the LAN-first routing to scenes and groups, runs as it would for
+# real. The lights' state lives in demo/world.json.
+
+DEMO_WORLD = os.path.join(DEMO_DIR, "world.json")
+DEMO_LIGHTS = [
+    # id, sku, name, LAN address, on, brightness, colour, kelvin
+    ("D0:E1:00:00:00:00:00:01", "H6008", "Desk Lamp", "192.0.2.21", 1, 70, 0, 3000),
+    ("D0:E1:00:00:00:00:00:02", "H6072", "Floor Lamp", "192.0.2.22", 1, 45, 0xFF7A00, 0),
+    ("D0:E1:00:00:00:00:00:03", "H6159", "Shelf Strip", None, 1, 80, 0x8A2BE2, 0),
+    ("D0:E1:00:00:00:00:00:04", "H6061", "Hexa Panels", None, 0, 60, 0x00E5FF, 0),
+    ("D0:E1:00:00:00:00:00:05", "H5080", "Fan", None, 0, None, None, None),
+]
+DEMO_GROUPS = {"Living room": ["D0:E1:00:00:00:00:00:02", "D0:E1:00:00:00:00:00:04"],
+               "Office": ["D0:E1:00:00:00:00:00:01", "D0:E1:00:00:00:00:00:03"]}
+DEMO_SCENES = [("Sunrise", 0xFF9A3C), ("Aurora", 0x3CFFB4), ("Ocean", 0x1E6BFF),
+               ("Candlelight", 0xFF8A2A), ("Rainbow", 0xFF2D95)]
+
+
+def demo_world():
+    world = read_json(DEMO_WORLD, {})
+    if not world:
+        world = {d[0]: {"on": d[4], "brightness": d[5], "rgb": d[6], "kelvin": d[7]} for d in DEMO_LIGHTS}
+        write_json(DEMO_WORLD, world)
+    return world
+
+
+def demo_change(device_id, **fields):
+    update_file(DEMO_WORLD, lambda world: world.setdefault(device_id, {}).update(fields))
+
+
+class DemoCloud:
+    def __init__(self, key="", timeout=8):
+        pass
+
+    def devices(self):
+        listed = []
+        for device_id, sku, name, _ip, _on, level, _rgb, _kelvin in DEMO_LIGHTS:
+            caps = [{"type": "devices.capabilities.on_off", "instance": "powerSwitch"}]
+            if level is not None:
+                caps += [
+                    {"type": "devices.capabilities.range", "instance": "brightness",
+                     "parameters": {"range": {"min": 1, "max": 100}}},
+                    {"type": "devices.capabilities.color_setting", "instance": "colorRgb"},
+                    {"type": "devices.capabilities.color_setting", "instance": "colorTemperatureK",
+                     "parameters": {"range": {"min": 2000, "max": 9000}}},
+                    {"type": "devices.capabilities.dynamic_scene", "instance": "lightScene"},
+                ]
+            listed.append({"sku": sku, "device": device_id, "deviceName": name, "capabilities": caps,
+                           "type": "devices.types.light" if level is not None else "devices.types.socket"})
+        return listed
+
+    def state(self, device):
+        light = demo_world().get(device["id"]) or {}
+        values = [("online", "online", True), ("on_off", "powerSwitch", light.get("on", 0))]
+        if light.get("brightness") is not None:
+            values += [("range", "brightness", light["brightness"]),
+                       ("color_setting", "colorRgb", light.get("rgb") or 0),
+                       ("color_setting", "colorTemperatureK", light.get("kelvin") or 0)]
+        return [{"type": f"devices.capabilities.{kind}", "instance": instance, "state": {"value": value}}
+                for kind, instance, value in values]
+
+    def control(self, device, cap_type, instance, value):
+        if instance == "powerSwitch":
+            demo_change(device["id"], on=value)
+        elif instance == "brightness":
+            demo_change(device["id"], brightness=value)
+        elif instance == "colorRgb":
+            demo_change(device["id"], rgb=value, kelvin=0)
+        elif instance == "colorTemperatureK":
+            demo_change(device["id"], kelvin=value)
+        elif cap_type == "dynamic_scene":
+            demo_change(device["id"], rgb=DEMO_SCENES[value["id"] - 1][1], kelvin=0)
+
+    def scenes(self, device):
+        return [{"name": name, "kind": "scene", "instance": "lightScene", "value": {"paramId": i, "id": i}}
+                for i, (name, _rgb) in enumerate(DEMO_SCENES, 1)]
+
+
+class DemoLan:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def scan(self, timeout=1.6):
+        return {d[0]: {"ip": d[3], "sku": d[1]} for d in DEMO_LIGHTS if d[3]}
+
+    def _by_ip(self, ip):
+        return next((d[0] for d in DEMO_LIGHTS if d[3] == ip), None)
+
+    def status(self, ips, timeout=1.0):
+        world, answers = demo_world(), {}
+        for ip in ips:
+            light = world.get(self._by_ip(ip))
+            if light:
+                rgb = light.get("rgb") or 0
+                answers[ip] = read_lan_state({
+                    "onOff": light["on"], "brightness": light["brightness"],
+                    "color": {"r": rgb >> 16 & 255, "g": rgb >> 8 & 255, "b": rgb & 255},
+                    "colorTemInKelvin": light.get("kelvin") or 0})
+        return answers
+
+    def command(self, ip, cmd, data):
+        device_id = self._by_ip(ip)
+        if cmd == "turn":
+            demo_change(device_id, on=data["value"])
+        elif cmd == "brightness":
+            demo_change(device_id, brightness=data["value"])
+        elif cmd == "colorwc" and data["colorTemInKelvin"]:
+            demo_change(device_id, kelvin=data["colorTemInKelvin"])
+        elif cmd == "colorwc":
+            color = data["color"]
+            demo_change(device_id, rgb=(color["r"] << 16) + (color["g"] << 8) + color["b"], kelvin=0)
+
+
+if DEMO:
+    Cloud, Lan = DemoCloud, DemoLan
+
 
 def read_lan_state(data):
     out = {"online": True}
@@ -707,6 +879,7 @@ def group_view(config, devices):
             "brightness": round(sum(levels) / len(levels)) if levels else None,
             "supports": {key: any(d["supports"].get(key) for d in present)
                          for key in ("brightness", "color", "temp", "scenes")},
+            "followsTheme": name in config["followTheme"],
         })
     return groups
 
@@ -730,8 +903,10 @@ def compose_state(config, registry, previous, fresh, cache, extra):
             entry.update(fresh[device["id"]])
             entry["updatedAt"] = time.time()
         entry["lan"] = bool(device.get("ip"))
+        entry["followsTheme"] = device["id"] in config["followTheme"]
         devices.append(entry)
     devices.sort(key=lambda d: (d["hidden"], d["name"].lower()))
+    theme = theme_color()
     state = {
         "updatedAt": time.time(),
         "configured": is_configured(config),
@@ -741,6 +916,9 @@ def compose_state(config, registry, previous, fresh, cache, extra):
         "usage": {"today": usage_today(cache), "limit": DAILY_LIMIT},
         "error": previous.get("error"),
         "version": plugin_version(),
+        "demo": DEMO,
+        "theme": {"color": hex_color(theme) if theme else "",
+                  "followAll": "all" in config["followTheme"]},
     }
     state.update(extra)
     return state
@@ -941,19 +1119,25 @@ def patch_devices(changes, error=None, clear_error=False):
     update_file(STATE_PATH, change)
 
 
-def apply(target, action, value):
+def apply(target, action, value, only_on=False):
     """Run one action on a target, LAN first, cloud for the rest.
 
-    `value` may depend on each device (relative brightness, toggle), so it is
-    a function of the device. The state file is updated before the network is
-    touched, so the panel moves at once, and rolled back for any device that
-    failed.
+    `target` is a name for resolve(), or a list of devices. `value` may depend
+    on each device (relative brightness, toggle), so it is a function of the
+    device. The state file is updated before the network is touched, so the
+    panel moves at once, and rolled back for any device that failed. With
+    `only_on`, lights that are off are left alone rather than woken.
     """
     config = load_config()
     if not is_configured(config):
         raise GoveeError("not set up yet: run `eld-govee setup`")
     state = current_state()
-    targets = [d for d in resolve(state, config, target) if supported(d, action)]
+    found = target if isinstance(target, list) else resolve(state, config, target)
+    targets = [d for d in found if supported(d, action)]
+    if only_on:
+        targets = [d for d in targets if d.get("power") and d.get("online") is not False]
+        if not targets:
+            return []
     if not targets:
         raise GoveeError(f"none of those lights support {action}")
     cloud = Cloud(api_key(config)) if has_cloud(config) else None
@@ -1213,10 +1397,15 @@ def cmd_group(args):
     if not name or name.lower() == "all":
         raise GoveeError("give the group a name (not 'all')")
     existing = next((k for k in config["groups"] if k.lower() == name.lower()), None)
+    if existing in config["followTheme"]:
+        config["followTheme"].remove(existing)
+        if args.action != "remove":
+            config["followTheme"].append(name)
     if args.action == "remove":
         if existing is None:
             raise GoveeError(f"no group called {name!r}")
         del config["groups"][existing]
+        install_theme_hook(bool(config["followTheme"]))
     else:
         state = current_state()
         members = []
@@ -1232,6 +1421,112 @@ def cmd_group(args):
     save_config(config)
     poll(max_age=10**9, scan=False)
     print(f"group {name}: {'removed' if args.action == 'remove' else 'saved'}")
+
+
+def follow_key(config, target):
+    """What config["followTheme"] stores for a target: "all", a group's name,
+    or one light's id."""
+    wanted = str(target).strip()
+    if wanted.lower() == "all":
+        return "all"
+    group = next((k for k in config["groups"] if k.lower() == wanted.lower()), None)
+    return group if group is not None else single_device(wanted)["id"]
+
+
+def install_theme_hook(enabled):
+    """Omarchy runs ~/.config/omarchy/hooks/theme-set.d/* after a theme
+    change. The hook is there only while something follows the theme. Demo
+    mode leaves it alone: it belongs to the real lights."""
+    if DEMO:
+        return
+    if not enabled:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(THEME_HOOK)
+        return
+    script = (
+        "#!/bin/bash\n"
+        "# Installed by eld-govee (Govee Lights for Omarchy): lights that follow the\n"
+        "# theme take its colour. Remove with: eld-govee theme unfollow all\n"
+        f"exe={shlex.quote(os.path.abspath(__file__))}\n"
+        "[[ -x $exe ]] || exe=$(command -v eld-govee) || exit 0\n"
+        "# In the background, so the LAN round trip never holds up the theme change.\n"
+        '"$exe" theme apply >/dev/null 2>&1 &\n'
+    )
+    os.makedirs(os.path.dirname(THEME_HOOK), exist_ok=True)
+    write_atomic(THEME_HOOK, script, mode=0o755)
+
+
+def theme_followers(config, state):
+    """Every light that follows the theme, directly or through a group."""
+    devices = {}
+    for key in config["followTheme"]:
+        with contextlib.suppress(GoveeError):  # a light or group since removed
+            for device in resolve(state, config, key):
+                devices[device["id"]] = device
+    return list(devices.values())
+
+
+def cmd_theme(args):
+    config = load_config()
+    if args.action == "apply":
+        # From the theme-set hook: recolour the followers that are on. Lights
+        # that are off stay off; a theme change should not light a room.
+        rgb = theme_color()
+        if rgb is None or not config["followTheme"] or not is_configured(config):
+            return
+        state = poll(max_age=60)
+        names = apply(theme_followers(config, state), "color", rgb, only_on=True)
+        print(f"{', '.join(names)}: {hex_color(rgb)}" if names else "no light that follows the theme is on")
+        return
+    if args.action == "status":
+        rgb = theme_color()
+        state = current_state()
+        print(f"theme colour: {hex_color(rgb) if rgb else 'unknown'}")
+        names = [d["name"] for d in theme_followers(config, state)]
+        print("followed by: " + (", ".join(names) if names else "nothing"))
+        return
+    if args.action == "unfollow" and args.target.strip().lower() == "all":
+        config["followTheme"] = []
+    else:
+        key = follow_key(config, args.target)
+        if args.action == "follow" and key not in config["followTheme"]:
+            config["followTheme"].append(key)
+        elif args.action == "unfollow" and key in config["followTheme"]:
+            config["followTheme"].remove(key)
+    save_config(config)
+    install_theme_hook(bool(config["followTheme"]))
+    state = poll(max_age=10**9, scan=False)
+    if args.action == "follow":
+        rgb = theme_color()
+        if rgb is not None:
+            apply(resolve(state, config, args.target), "color", rgb, only_on=True)
+        print(f"{args.target} follows the theme")
+    else:
+        print(f"{args.target} no longer follows the theme")
+
+
+def cmd_demo(args):
+    if args.action == "status":
+        print("demo mode is " + ("on" if DEMO else "off"))
+        return
+    if args.action == "on":
+        write_json(os.path.join(DEMO_DIR, "world.json"), {})
+        write_json(os.path.join(DEMO_DIR, "cache.json"), {})
+        write_json(os.path.join(DEMO_DIR, "config.json"), {
+            "keyStore": "demo", "apiKey": "demo", "groups": DEMO_GROUPS,
+            "aliases": {}, "hidden": [], "followTheme": []})
+    else:
+        shutil.rmtree(DEMO_DIR, ignore_errors=True)
+    # The paths are fixed when the helper starts, so a fresh run rebuilds
+    # state.json from the config now in force.
+    subprocess.run([sys.executable, os.path.abspath(__file__), "poll", "--devices", "--max-age", "0"],
+                   check=False, timeout=60)
+    update_file(STATE_PATH, lambda state: state.update(error=None))
+    if args.action == "on":
+        print("Demo mode on: made-up lights in the panel. Your own setup is untouched.")
+        print("Turn it off with: eld-govee demo off")
+    else:
+        print("Demo mode off.")
 
 
 def single_device(target):
@@ -1305,6 +1600,10 @@ def cmd_doctor(args):
                 print("  info turn on LAN Control per light in the Govee Home app, if the model has it")
     except GoveeError as error:
         check(False, "LAN", str(error))
+    rgb = theme_color()
+    print(f"  info Omarchy theme colour: {hex_color(rgb) if rgb else 'not found'}")
+    if config["followTheme"]:
+        check(os.access(THEME_HOOK, os.X_OK), "theme-set hook installed", THEME_HOOK)
     sys.exit(0 if ok else 1)
 
 
@@ -1383,6 +1682,18 @@ def main():
     p = sub.add_parser("unhide", help="show a hidden light again")
     p.add_argument("device")
     p.set_defaults(func=lambda a: cmd_hide(a, hide=False))
+    p = sub.add_parser("theme", help="lights that take the Omarchy theme's colour")
+    theme = p.add_subparsers(dest="action")
+    t = theme.add_parser("follow", help="a light, group or 'all' follows the theme from now on")
+    t.add_argument("target")
+    t = theme.add_parser("unfollow", help="stop following ('all' stops every one)")
+    t.add_argument("target")
+    theme.add_parser("apply", help="recolour the followers that are on (run by the theme-set hook)")
+    theme.add_parser("status", help="the theme's colour and what follows it")
+    p.set_defaults(func=cmd_theme, action="status")
+    p = sub.add_parser("demo", help="made-up lights, for screenshots and trying the plugin")
+    p.add_argument("action", nargs="?", choices=["on", "off", "status"], default="status")
+    p.set_defaults(func=cmd_demo)
     sub.add_parser("dismiss", help="clear the last error (used by the panel)").set_defaults(func=cmd_dismiss)
     sub.add_parser("doctor", help="check the setup").set_defaults(func=cmd_doctor)
 

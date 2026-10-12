@@ -1,8 +1,8 @@
 """Load bin/eld-govee as a module, isolated from the real user.
 
-The helper reads XDG_* variables when it is imported, so they point at a
-throwaway directory before loading: tests never see or touch real config,
-state or API keys. A fake secret-tool stands in for the keyring, a local
+The helper reads HOME and the XDG_* variables when it is imported, so they
+point at a throwaway directory before loading: tests never see or touch real
+config, state, API keys, Omarchy theme or hooks. A fake secret-tool stands in for the keyring, a local
 HTTP server for the Govee cloud, and a UDP responder for a LAN light.
 """
 
@@ -22,6 +22,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLI = str(ROOT / "bin" / "eld-govee")
 SANDBOX = tempfile.mkdtemp(prefix="eld-govee-test-")
 os.chmod(SANDBOX, 0o700)
+os.environ["HOME"] = os.path.join(SANDBOX, "home")
+os.makedirs(os.environ["HOME"], mode=0o700)
 for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
     path = os.path.join(SANDBOX, name.lower())
     os.makedirs(path, mode=0o700, exist_ok=True)

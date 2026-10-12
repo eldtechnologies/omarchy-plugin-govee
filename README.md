@@ -1,8 +1,8 @@
 # Govee Lights for Omarchy
 
 Your Govee lights in the Omarchy bar: switch them on and off, set brightness,
-colour and white temperature, apply Govee's scenes, and control rooms of
-lights as groups. Lights with LAN Control are driven over your local network,
+colour and white temperature, apply Govee's scenes, control rooms of lights
+as groups, and let them take your Omarchy theme's colour. Lights with LAN Control are driven over your local network,
 instantly and without the cloud. Everything else goes through the official
 Govee cloud API. Setup happens in the panel, and the API key stays out of the
 shell.
@@ -10,7 +10,7 @@ shell.
 In the bar it is a single bulb. It lights up, in your theme's accent colour,
 while any light is on.
 
-Version 0.1.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
+Version 0.2.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
 
 > **Unofficial.** This is an independent community plugin. It is not made,
 > endorsed, or supported by Govee or by the Omarchy project.
@@ -19,11 +19,12 @@ Version 0.1.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologie
 
 | Lights and groups | Colour, white and scenes |
 |---|---|
-| ![The panel: two groups and five lights, each with a switch, a brightness slider and a dot in its current colour](docs/screenshots/panel.png) | ![A light opened up: colour swatches, a hue strip, a warm-to-cool white slider, scenes, and its name](docs/screenshots/colours.png) |
+| ![The panel: two groups and five lights, each with a switch, a brightness slider and a dot in its current colour](docs/screenshots/panel.png) | ![A light opened up: colour swatches, a hue strip, a warm-to-cool white slider, scenes, Follow theme, and its name](docs/screenshots/colours.png) |
 
 ![First run: paste a Govee API key, or choose LAN only](docs/screenshots/setup.png)
 
-*The lights and names in these screenshots are demo data. The screenshots
+*The lights in these screenshots are made up, from the plugin's demo mode
+(see [Trying it without lights](#trying-it-without-lights)). The screenshots
 themselves are of the real plugin.*
 
 ## Requirements
@@ -102,7 +103,7 @@ fall back to the cloud.
   dims or brightens the lights that are on.
 - Each light has a switch, a brightness slider while it is on, and a dot in
   its current colour. **Click its name** for colour swatches, a hue strip, a
-  warm-to-cool white slider, scenes, its name, and Hide.
+  warm-to-cool white slider, scenes, Follow theme, its name, and Hide.
 - **All on / All off** in the header.
 - Keyboard: ↑/↓ select, Enter switches, ←/→ dims or brightens by 10%,
   E opens colours, A switches everything, R refreshes, Esc closes.
@@ -115,6 +116,31 @@ name works everywhere: in the panel, in groups and on the command line
 (`eld-govee on "Floor lamp"`). It is stored locally, in
 `~/.config/eld-govee/config.json`, and takes priority over the name in the
 Govee app; Govee itself is never changed.
+
+### Theme colours
+
+Open a light or a group and turn on **Follow theme**. From then on, when you
+change your Omarchy theme, it takes the theme's colour. The dot next to the
+switch shows that colour; click it to use it once without following.
+
+![Follow theme: a dot in the theme's colour (magenta for Tokyo Night) and a switch](docs/screenshots/theme.png)
+
+- The colour is the one Omarchy gives RGB keyboards (`keyboard.rgb` in the
+  theme): the theme's accent, unless the theme picks its own. It is used at
+  full strength, and your brightness stays as it is.
+- Only lights that are on change. A theme change never turns a light on.
+- It works through an Omarchy hook,
+  `~/.config/omarchy/hooks/theme-set.d/eld-govee`, which the plugin adds
+  while anything follows the theme and removes when nothing does.
+
+From a terminal:
+
+```bash
+eld-govee theme follow Office         # a light, a group, or all
+eld-govee theme unfollow all
+eld-govee theme                       # the theme's colour, and what follows it
+eld-govee color "Desk Lamp" theme     # the theme's colour, once
+```
 
 ### Groups
 
@@ -149,6 +175,7 @@ eld-govee scene "Shelf" Aurora
 eld-govee scenes "Shelf"               # what scenes that light has
 eld-govee rename "H6008 0011" "Desk Lamp"
 eld-govee hide "Fan Plug"              # leaves the panel and 'all'
+eld-govee theme follow Office          # see Theme colours
 ```
 
 In `~/.config/hypr/bindings.lua`, `--notify` turns errors into desktop
@@ -164,6 +191,18 @@ o.bind("SUPER + CTRL + ALT + BRACKETLEFT", "Dimmer lights", "eld-govee --notify 
 The panel itself also answers IPC:
 `omarchy-shell com.eldtechnologies.govee toggle` (also `open`, `close`,
 `refresh`).
+
+## Trying it without lights
+
+```bash
+eld-govee demo on     # five made-up lights and two groups
+eld-govee demo off    # back to your own
+```
+
+Demo lights behave like real ones, LAN and cloud alike: switches, colours,
+scenes, groups and names all work. Nothing goes over the network, and your
+own config, groups and API key are left alone. **Leave demo** in the panel
+footer turns it off.
 
 ## Configuration
 
@@ -183,6 +222,8 @@ The helper keeps its own files out of the shell's:
 - `~/.local/state/eld-govee/state.json`: what the panel shows
 - `~/.local/state/eld-govee/cache.json`: the device list, scenes, LAN
   addresses and today's cloud request count
+- `~/.local/state/eld-govee/demo/`: demo mode's own config and lights, while
+  it is on
 
 ## How it works
 
@@ -224,7 +265,11 @@ omarchy plugin remove com.eldtechnologies.govee
 ./uninstall.sh --purge    # deletes them
 ```
 
-Removing the key locally does not revoke it with Govee.
+Removing the key locally does not revoke it with Govee. `uninstall.sh` also
+removes the theme hook; after `omarchy plugin remove`, run
+`eld-govee theme unfollow all` first, or delete
+`~/.config/omarchy/hooks/theme-set.d/eld-govee` (left behind, it does
+nothing).
 
 ## Developing
 
