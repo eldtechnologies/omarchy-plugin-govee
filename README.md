@@ -134,7 +134,9 @@ eld-govee group remove Office
 ### Keybindings and scripts
 
 Every panel action is a command. A target is a light's name (a unique part of
-it is enough), a group, a device ID, or `all`:
+it is enough), a group, a device ID, or `all`. `./install.sh` puts
+`eld-govee` on your `PATH`; after `omarchy plugin add` it is at
+`~/.config/omarchy/plugins/com.eldtechnologies.govee/bin/eld-govee`.
 
 ```bash
 eld-govee list                         # every light and its state
@@ -149,13 +151,14 @@ eld-govee rename "H6008 0011" "Desk Lamp"
 eld-govee hide "Fan Plug"              # leaves the panel and 'all'
 ```
 
-In `~/.config/hypr/bindings.conf`, `--notify` turns errors into desktop
-notifications:
+In `~/.config/hypr/bindings.lua`, `--notify` turns errors into desktop
+notifications. These keys are free in a stock Omarchy; check yours with
+`omarchy menu keybindings --print`:
 
-```
-bindd = SUPER ALT, L, Toggle lights, exec, eld-govee --notify toggle
-bindd = SUPER ALT, bracketright, Brighter lights, exec, eld-govee --notify brightness all +10
-bindd = SUPER ALT, bracketleft, Dimmer lights, exec, eld-govee --notify brightness all -10
+```lua
+o.bind("SUPER + ALT + L", "Toggle lights", "eld-govee --notify toggle")
+o.bind("SUPER + CTRL + ALT + BRACKETRIGHT", "Brighter lights", "eld-govee --notify brightness all +10")
+o.bind("SUPER + CTRL + ALT + BRACKETLEFT", "Dimmer lights", "eld-govee --notify brightness all -10")
 ```
 
 The panel itself also answers IPC:
